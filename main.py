@@ -8,7 +8,8 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, error
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from telegram.constants import ChatType
 from typing import Dict, List, Tuple
-from pymongo import MongoClient
+import json
+import threading
 
 # --- Logging Configuration ---
 logging.basicConfig(
@@ -19,8 +20,7 @@ logger = logging.getLogger(__name__)
 # --- Load Environment Variables ---
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-MONGO_URL = os.getenv("MONGO_URL")
-MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "WordRushDB")
+JSON_DB_PATH = os.getenv("JSON_DB_PATH", "database.json")
 try:
     ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID")) 
 except (TypeError, ValueError):
@@ -68,141 +68,173 @@ if os.path.exists(WORD_FILE_PATH):
 else:
     logger.error(f"❌ word.txt not found at {WORD_FILE_PATH}")
          
-# --- MongoDB Manager Class (Unchanged from your last version) ---
-class MongoDBManager:
-    """Handles all interactions with MongoDB, now with time-based leaderboards."""
-    def __init__(self, mongo_url: str, db_name: str):
-        if not mongo_url:
-            raise ValueError("MONGO_URL not provided.")
-        
-        self.client = MongoClient(mongo_url, serverSelectionTimeoutMS=10000) 
-        self.db = self.client[db_name]
-        self.leaderboard_collection = self.db['leaderboard']
-        self.games_collection = self.db['active_games']
-        self.chats_collection = self.db['known_chats'] 
-        
-        self.leaderboard_collection.create_index("user_id", unique=True)
-        self.games_collection.create_index("chat_id", unique=True)
-        self.chats_collection.create_index("chat_id", unique=True)
-        logger.info("✅ MongoDB connection and indexing successful.")
+# --- JSON Database Manager Class ---
+class JSONDatabaseManager:
+    """Handles all interactions with JSON file based database with time-based leaderboards."""
+    def __init__(self, db_path: str = "database.json"):
+        self.db_path = db_path
+        self.lock = threading.Lock()
+        self.data = {
+            "leaderboard": {},
+            "active_games": {},
+            "known_chats": {}
+        }
+        self._load()
 
-    def _get_reset_check_query(self, user_id: int, period: str) -> dict:
-        """Determines if the points/wins for a period need a reset."""
-        now = datetime.now(timezone.utc)
-        
-        if period == 'daily':
-            reset_after = now - timedelta(days=1)
-        elif period == 'weekly':
-            reset_after = now - timedelta(weeks=1)
-        elif period == 'monthly':
-            reset_after = now - timedelta(days=30)
-        else: # Global
-            return {'$set': {}}
+    def _load(self):
+        with self.lock:
+            if os.path.exists(self.db_path):
+                try:
+                    with open(self.db_path, "r", encoding="utf-8") as f:
+                        loaded_data = json.load(f)
+                        if isinstance(loaded_data, dict):
+                            self.data["leaderboard"] = loaded_data.get("leaderboard", {})
+                            self.data["active_games"] = loaded_data.get("active_games", {})
+                            self.data["known_chats"] = loaded_data.get("known_chats", {})
+                    logger.info(f"✅ JSON Database loaded successfully from {self.db_path}.")
+                except Exception as e:
+                    logger.error(f"❌ Failed to load JSON Database from {self.db_path}: {e}")
+            else:
+                logger.info(f"ℹ️ JSON Database file {self.db_path} does not exist yet. Initializing new structure.")
+                self._save_unlocked()
 
-        # $lt checks if the last win was BEFORE the reset threshold
-        return {
-            '$inc': {f'points_{period}': 0, f'wins_{period}': 0}, # Dummy $inc to allow $set
-            '$set': {
-                f'points_{period}': 0, 
-                f'wins_{period}': 0,
-            }
-        }, {f'last_win_date_{period}': {'$lt': reset_after}}
+    def _save_unlocked(self):
+        temp_path = f"{self.db_path}.tmp"
+        try:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, indent=2)
+            os.replace(temp_path, self.db_path)
+        except Exception as e:
+            logger.error(f"❌ Failed to save JSON Database to {self.db_path}: {e}")
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
 
+    def _save(self):
+        with self.lock:
+            self._save_unlocked()
+
+    def _check_and_reset_period(self, user_data: dict, period: str, now: datetime):
+        if period == "global":
+            return
+
+        last_win_str = user_data.get(f"last_win_date_{period}")
+        if not last_win_str:
+            return
+
+        try:
+            last_win_date = datetime.fromisoformat(last_win_str)
+            if last_win_date.tzinfo is None:
+                last_win_date = last_win_date.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            last_win_date = None
+
+        if period == "daily":
+            threshold = now - timedelta(days=1)
+        elif period == "weekly":
+            threshold = now - timedelta(weeks=1)
+        elif period == "monthly":
+            threshold = now - timedelta(days=30)
+        else:
+            return
+
+        if last_win_date and last_win_date < threshold:
+            user_data[f"points_{period}"] = 0
+            user_data[f"wins_{period}"] = 0
 
     def update_leaderboard(self, user_id: int, username: str, points_to_add: int):
-        now = datetime.now(timezone.utc)
-        update_global = {
-            '$inc': {'points_global': points_to_add, 'wins_global': 1},
-            '$set': {'username': username}
-        }
-        
-        # 1. Update Global stats
-        self.leaderboard_collection.update_one(
-            {'user_id': user_id},
-            update_global,
-            upsert=True
-        )
-        
-        # 2. Update Time-based stats
-        periods = ['daily', 'weekly', 'monthly']
-        for period in periods:
-            update_op, reset_query = self._get_reset_check_query(user_id, period)
-            
-            # 2a. Check if reset is needed and perform reset if true
-            # We use $inc: 0 and $set to conditionally set the points/wins to 0 
-            # if the last win date is too old.
-            
-            reset_result = self.leaderboard_collection.update_one(
-                {'user_id': user_id, f'last_win_date_{period}': {'$lt': now - timedelta(days=1) if period == 'daily' else now - timedelta(weeks=1) if period == 'weekly' else now - timedelta(days=30)}},
-                {'$set': {f'points_{period}': 0, f'wins_{period}': 0}}
-            )
+        with self.lock:
+            now = datetime.now(timezone.utc)
+            user_key = str(user_id)
+            if user_key not in self.data["leaderboard"]:
+                self.data["leaderboard"][user_key] = {
+                    "user_id": user_id,
+                    "username": username,
+                    "points_global": 0,
+                    "wins_global": 0,
+                    "points_daily": 0,
+                    "wins_daily": 0,
+                    "points_weekly": 0,
+                    "wins_weekly": 0,
+                    "points_monthly": 0,
+                    "wins_monthly": 0,
+                }
 
-            # 2b. Now, increment the period-specific points/wins and update the win date
-            self.leaderboard_collection.update_one(
-                {'user_id': user_id},
-                {
-                    '$inc': {f'points_{period}': points_to_add, f'wins_{period}': 1},
-                    '$set': {f'last_win_date_{period}': now}
-                },
-                upsert=True
-            )
+            user_data = self.data["leaderboard"][user_key]
+            user_data["username"] = username
+            user_data["points_global"] = user_data.get("points_global", 0) + points_to_add
+            user_data["wins_global"] = user_data.get("wins_global", 0) + 1
 
+            for period in ["daily", "weekly", "monthly"]:
+                self._check_and_reset_period(user_data, period, now)
+                user_data[f"points_{period}"] = user_data.get(f"points_{period}", 0) + points_to_add
+                user_data[f"wins_{period}"] = user_data.get(f"wins_{period}", 0) + 1
+                user_data[f"last_win_date_{period}"] = now.isoformat()
+
+            self._save_unlocked()
 
     def get_leaderboard_data(self, period: str, limit=10) -> List[Tuple[str, int, int]]:
-        """Retrieves leaderboard data for a specific period (daily, weekly, monthly, global)."""
-        points_key = f'points_{period}'
-        wins_key = f'wins_{period}'
-        
-        # Query: Find all entries, sort by points for the given period
-        data = list(self.leaderboard_collection.find().sort(points_key, -1).limit(limit))
-        
-        result = []
-        for doc in data:
-            points = doc.get(points_key, 0)
-            wins = doc.get(wins_key, 0)
-            
-            # Ensure we only show users who have actually played in this period (points > 0)
-            if points > 0 or period == 'global':
-                 result.append((doc.get('username'), points, wins))
-                 
-        # Re-sort to ensure integrity
-        result.sort(key=lambda x: x[1], reverse=True)
-        return result[:limit]
+        with self.lock:
+            now = datetime.now(timezone.utc)
+            points_key = f"points_{period}"
+            wins_key = f"wins_{period}"
+
+            result = []
+            for user_data in self.data["leaderboard"].values():
+                if period != "global":
+                    self._check_and_reset_period(user_data, period, now)
+
+                points = user_data.get(points_key, 0)
+                wins = user_data.get(wins_key, 0)
+
+                if points > 0 or period == "global":
+                    result.append((user_data.get("username", "Unknown"), points, wins))
+
+            result.sort(key=lambda x: x[1], reverse=True)
+            return result[:limit]
 
     def get_game_state(self, chat_id: int) -> Dict | None:
-        return self.games_collection.find_one({'chat_id': chat_id})
+        with self.lock:
+            game = self.data["active_games"].get(str(chat_id))
+            return game.copy() if game else None
 
     def save_game_state(self, chat_id: int, state: Dict):
-        state_to_save = {'chat_id': chat_id, **state}
-        self.games_collection.replace_one(
-            {'chat_id': chat_id}, 
-            state_to_save, 
-            upsert=True
-        )
+        with self.lock:
+            state_to_save = {"chat_id": chat_id, **state}
+            self.data["active_games"][str(chat_id)] = state_to_save
+            self._save_unlocked()
 
     def delete_game_state(self, chat_id: int):
-        self.games_collection.delete_one({'chat_id': chat_id})
+        with self.lock:
+            if str(chat_id) in self.data["active_games"]:
+                del self.data["active_games"][str(chat_id)]
+                self._save_unlocked()
 
     def add_chat(self, chat_id: int, chat_type: str, date: float):
-        self.chats_collection.update_one(
-            {'chat_id': chat_id},
-            {'$set': {'chat_type': chat_type, 'last_active': date}},
-            upsert=True
-        )
+        with self.lock:
+            self.data["known_chats"][str(chat_id)] = {
+                "chat_id": chat_id,
+                "chat_type": chat_type,
+                "last_active": date
+            }
+            self._save_unlocked()
 
     def get_all_chat_ids(self) -> List[int]:
-        return [doc['chat_id'] for doc in self.chats_collection.find({}, {'chat_id': 1})]
+        with self.lock:
+            return [chat["chat_id"] for chat in self.data["known_chats"].values()]
 
-# --- Initialize MongoDB Manager ---
-mongo_manager = None
+# --- Initialize JSON Database Manager ---
+db_manager = None
 try:
-    if MONGO_URL:
-        mongo_manager = MongoDBManager(MONGO_URL, MONGO_DB_NAME)
-    else:
-        logger.error("❌ MONGO_URL not set. Running without database features.")
+    db_manager = JSONDatabaseManager(JSON_DB_PATH)
+    logger.info(f"✅ JSON Database initialized successfully at {JSON_DB_PATH}.")
 except Exception as e:
-    logger.error(f"❌ FATAL: Could not connect to MongoDB. Error: {e}")
-    mongo_manager = None 
+    logger.error(f"❌ FATAL: Could not initialize JSON Database. Error: {e}")
+    db_manager = None
+
+mongo_manager = db_manager
 
 # --- Core Game Logic Functions ---
 # (get_feedback and calculate_points remain unchanged)
@@ -241,7 +273,7 @@ def calculate_points(difficulty: str, guesses: int) -> int:
     return base + bonus
 
 async def start_new_game_logic(chat_id: int, difficulty: str) -> Tuple[bool, str]:
-    if not mongo_manager: return False, "❌ *Database Error*. Game cannot be started without database access."
+    if not db_manager: return False, "❌ *Database Error*. Game cannot be started without database access."
     
     difficulty = difficulty.lower()
     if difficulty not in DIFFICULTY_CONFIG:
@@ -265,7 +297,7 @@ async def start_new_game_logic(chat_id: int, difficulty: str) -> Tuple[bool, str
         'guess_history': [],
         'guessed_words': [] # NEW: To track unique words guessed
     }
-    mongo_manager.save_game_state(chat_id, initial_state)
+    db_manager.save_game_state(chat_id, initial_state)
     
     return True, (
         f"**✨ New Word Rush Challenge!**\n"
@@ -277,9 +309,9 @@ async def start_new_game_logic(chat_id: int, difficulty: str) -> Tuple[bool, str
 
 async def process_guess_logic(chat_id: int, guess: str) -> Tuple[str, bool, str, int, List[str]]:
     """Processes a user's guess and returns feedback, win status, and points."""
-    if not mongo_manager: return "", False, "Database Error.", 0, []
+    if not db_manager: return "", False, "Database Error.", 0, []
 
-    game = mongo_manager.get_game_state(chat_id)
+    game = db_manager.get_game_state(chat_id)
     if not game:
         return "", False, "No active game.", 0, []
     
@@ -318,7 +350,7 @@ async def process_guess_logic(chat_id: int, guess: str) -> Tuple[str, bool, str,
         guesses = game['guesses_made']
         points = calculate_points(game['difficulty'], guesses)
         game_word_for_loss = game['word']
-        mongo_manager.delete_game_state(chat_id) 
+        db_manager.delete_game_state(chat_id)
         return feedback_str, True, "WIN", points, game['guess_history']
 
     # 5. Check for Loss
@@ -326,12 +358,12 @@ async def process_guess_logic(chat_id: int, guess: str) -> Tuple[str, bool, str,
     
     if remaining <= 0:
         game_word_for_loss = game['word']
-        mongo_manager.delete_game_state(chat_id) 
+        db_manager.delete_game_state(chat_id)
         # For loss, we return the secret word as status
         return feedback_str, False, f"LOSS_WORD:{game_word_for_loss}", 0, game['guess_history']
     
     # Status for ongoing game
-    mongo_manager.save_game_state(chat_id, game)
+    db_manager.save_game_state(chat_id, game)
     return feedback_str, False, f"Guesses left: **{remaining}**", 0, game['guess_history']
 
 # --- Telegram UI & Handler Functions (All Unchanged) ---
@@ -406,11 +438,11 @@ def get_leaderboard_menu_keyboard():
 
 async def display_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE, period: str):
     """Fetches and displays the leaderboard for the given period."""
-    if not mongo_manager:
+    if not db_manager:
         await (update.callback_query.edit_message_text if update.callback_query else update.message.reply_text)("❌ *Database Error*. Cannot fetch leaderboard.")
         return
 
-    data = mongo_manager.get_leaderboard_data(period=period, limit=10)
+    data = db_manager.get_leaderboard_data(period=period, limit=10)
     
     title = period.capitalize() if period != 'global' else 'Global'
     
@@ -433,8 +465,8 @@ async def display_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE
 # --- Command Handlers (All Unchanged) ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if mongo_manager and update.effective_message:
-        mongo_manager.add_chat(update.effective_chat.id, update.effective_chat.type.name, update.effective_message.date.timestamp())
+    if db_manager and update.effective_message:
+        db_manager.add_chat(update.effective_chat.id, update.effective_chat.type.name, update.effective_message.date.timestamp())
     
     user = update.effective_user
     chat = update.effective_chat
@@ -457,12 +489,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def new_game_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    if mongo_manager and update.effective_message:
-        mongo_manager.add_chat(chat_id, update.effective_chat.type.name, update.effective_message.date.timestamp())
+    if db_manager and update.effective_message:
+        db_manager.add_chat(chat_id, update.effective_chat.type.name, update.effective_message.date.timestamp())
 
     difficulty = context.args[0].lower() if context.args else 'medium'
     
-    if mongo_manager and mongo_manager.get_game_state(chat_id):
+    if db_manager and db_manager.get_game_state(chat_id):
         await update.message.reply_text("⏳ *A game is already active*. Use **/end** to stop it first.")
         return
 
@@ -477,7 +509,7 @@ async def new_game_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def end_game_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     
-    if not mongo_manager or not mongo_manager.get_game_state(chat_id):
+    if not db_manager or not db_manager.get_game_state(chat_id):
         await update.message.reply_text("❌ *No game is currently running to end*.")
         return
         
@@ -485,9 +517,9 @@ async def end_game_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("🚨 *Admin Check Failed*. You must be an **Admin** to force-end the game.", parse_mode='Markdown')
         return
 
-    game_state = mongo_manager.get_game_state(chat_id)
+    game_state = db_manager.get_game_state(chat_id)
     word = game_state.get('word', 'UNKNOWN')
-    mongo_manager.delete_game_state(chat_id)
+    db_manager.delete_game_state(chat_id)
     
     user = update.effective_user
     user_info = f"@{user.username}" if user and user.username else (user.first_name if user else "User")
@@ -503,11 +535,11 @@ async def end_game_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Shows the current game status and guess history."""
     chat_id = update.effective_chat.id
-    if not mongo_manager:
+    if not db_manager:
         await update.message.reply_text("❌ *Database Error*. Cannot fetch game status.")
         return
 
-    game_state = mongo_manager.get_game_state(chat_id)
+    game_state = db_manager.get_game_state(chat_id)
     if not game_state:
         await update.message.reply_text("🎯 *No active game*. Use **/new** to start a challenge!")
         return
@@ -536,8 +568,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Shows the leaderboard menu or the global leaderboard directly."""
-    if mongo_manager and update.effective_message:
-        mongo_manager.add_chat(update.effective_chat.id, update.effective_chat.type.name, update.effective_message.date.timestamp())
+    if db_manager and update.effective_message:
+        db_manager.add_chat(update.effective_chat.id, update.effective_chat.type.name, update.effective_message.date.timestamp())
 
     # If arguments are provided (e.g., /leaderboard daily), show that specific one
     if context.args and context.args[0].lower() in ['daily', 'weekly', 'monthly', 'global']:
@@ -584,12 +616,12 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("Usage: `/broadcast <your message here>`", parse_mode='Markdown')
         return
     
-    if not mongo_manager:
+    if not db_manager:
         await update.message.reply_text("❌ Database error. Cannot retrieve chat list.")
         return
 
     message_to_send = " ".join(context.args)
-    chat_ids = mongo_manager.get_all_chat_ids()
+    chat_ids = db_manager.get_all_chat_ids()
     
     success_count = 0
     fail_count = 0
@@ -687,7 +719,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif query.data.startswith("start_"):
         difficulty = query.data.split('_')[1]
         
-        if mongo_manager and mongo_manager.get_game_state(chat_id):
+        if db_manager and db_manager.get_game_state(chat_id):
             await query.edit_message_text("⏳ *A game is already active*. Use **/end** to stop it first.")
             return
 
@@ -711,10 +743,10 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     username = user.username or user.first_name
     logger.info(f"Guess received in chat {chat_id} from {username}: {guess}")
 
-    if not mongo_manager:
+    if not db_manager:
         return
 
-    game_state = mongo_manager.get_game_state(chat_id)
+    game_state = db_manager.get_game_state(chat_id)
     if not game_state:
         return 
 
@@ -737,7 +769,7 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         word_was = guess_history[-1].split(' - ')[-1].replace('**', '').strip() 
         
         # This function now updates global, daily, weekly, and monthly scores
-        mongo_manager.update_leaderboard(user.id, username, points)
+        db_manager.update_leaderboard(user.id, username, points)
         log_msg = f"🏆 **Game Won!**\n👤 **Winner:** @{username} (`{user.id}`)\n💬 **Chat ID:** `{chat_id}`\n🔑 **Word:** `{word_was}`\n🎯 **Points:** `{points}` ({len(guess_history)} attempts)"
         await send_log_notification(context, log_msg)
         
@@ -804,7 +836,7 @@ def main():
     application.add_handler(CommandHandler("difficulty", difficulty_command)) 
     application.add_handler(CommandHandler("status", status_command)) 
     
-    if ADMIN_USER_ID != 0 and mongo_manager is not None:
+    if ADMIN_USER_ID != 0 and db_manager is not None:
         application.add_handler(CommandHandler("broadcast", broadcast_command))
     
     application.add_handler(CommandHandler("help", start_command)) 
