@@ -811,7 +811,7 @@ async def new_game_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         difficulty = "medium"
     
     if db_manager and db_manager.get_game_state(chat_id):
-        await update.message.reply_text("⏳ *A game is already active*. Use **/end** to stop it first.")
+        await update.message.reply_text("⏳ A game is already active. Use /end to stop it first..")
         return
 
     success, message = await start_new_game_logic(chat_id, difficulty)
@@ -860,7 +860,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     game_state = db_manager.get_game_state(chat_id)
     if not game_state:
-        await update.message.reply_text("🎯 *No active game*. Use **/new** to start a challenge!")
+        await update.message.reply_text("🎯 No active game. Use /new to start a challenge!")
         return
     
     guess_history = game_state.get('guess_history', [])
