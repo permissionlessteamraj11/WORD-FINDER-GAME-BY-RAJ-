@@ -603,12 +603,97 @@ def get_leaderboard_menu_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
+
+# --- Helper for Safe Callback Message Editing ---
+
+async def safe_edit_message(
+    target,
+    text: str,
+    reply_markup=None,
+    parse_mode: str = 'Markdown',
+    disable_web_page_preview=None
+) -> None:
+    """
+    Safely edits a message in response to a callback query or update.
+    Handles photo/media messages by editing caption, suppresses 'Message is not modified'
+    errors, and falls back to reply_text if editing fails.
+    """
+    query = getattr(target, 'callback_query', None) if hasattr(target, 'callback_query') and target.callback_query else target
+    message = getattr(query, 'message', None) if hasattr(query, 'message') else None
+
+    is_media = False
+    if message:
+        if getattr(message, 'photo', None) or getattr(message, 'caption', None) is not None:
+            is_media = True
+
+    try:
+        if is_media and hasattr(query, 'edit_message_caption'):
+            kwargs = {}
+            if parse_mode:
+                kwargs['parse_mode'] = parse_mode
+            if reply_markup is not None:
+                kwargs['reply_markup'] = reply_markup
+            await query.edit_message_caption(caption=text, **kwargs)
+            return
+        elif hasattr(query, 'edit_message_text'):
+            kwargs = {}
+            if parse_mode:
+                kwargs['parse_mode'] = parse_mode
+            if reply_markup is not None:
+                kwargs['reply_markup'] = reply_markup
+            if disable_web_page_preview is not None:
+                kwargs['disable_web_page_preview'] = disable_web_page_preview
+            await query.edit_message_text(text=text, **kwargs)
+            return
+    except error.BadRequest as e:
+        err_str = str(e).lower()
+        if 'message is not modified' in err_str:
+            return
+        if 'there is no text in the message to edit' in err_str or 'message to edit not found' in err_str:
+            if hasattr(query, 'edit_message_caption'):
+                try:
+                    kwargs = {}
+                    if parse_mode:
+                        kwargs['parse_mode'] = parse_mode
+                    if reply_markup is not None:
+                        kwargs['reply_markup'] = reply_markup
+                    await query.edit_message_caption(caption=text, **kwargs)
+                    return
+                except error.BadRequest as e2:
+                    if 'message is not modified' in str(e2).lower():
+                        return
+                    logger.warning(f'Failed to edit message caption in fallback: {e2}')
+        logger.warning(f'safe_edit_message edit failed ({e}), attempting fallback message...')
+
+    # Fallback sending new message
+    try:
+        if message and hasattr(message, 'reply_text'):
+            kwargs = {}
+            if parse_mode:
+                kwargs['parse_mode'] = parse_mode
+            if reply_markup is not None:
+                kwargs['reply_markup'] = reply_markup
+            if disable_web_page_preview is not None:
+                kwargs['disable_web_page_preview'] = disable_web_page_preview
+            await message.reply_text(text=text, **kwargs)
+        elif hasattr(target, 'effective_message') and target.effective_message:
+            kwargs = {}
+            if parse_mode:
+                kwargs['parse_mode'] = parse_mode
+            if reply_markup is not None:
+                kwargs['reply_markup'] = reply_markup
+            if disable_web_page_preview is not None:
+                kwargs['disable_web_page_preview'] = disable_web_page_preview
+            await target.effective_message.reply_text(text=text, **kwargs)
+    except Exception as fallback_err:
+        logger.error(f'Failed to fallback reply_text in safe_edit_message: {fallback_err}')
+
 # --- Leaderboard Utility Function (Unchanged) ---
 
 async def display_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE, period: str):
     """Fetches and displays the leaderboard for the given period."""
     if not db_manager:
-        await (update.callback_query.edit_message_text if update.callback_query else update.message.reply_text)("❌ *Database Error*. Cannot fetch leaderboard.")
+        await safe_edit_message(update, "❌ *Database Error*. Cannot fetch leaderboard.")
         return
 
     data = db_manager.get_leaderboard_data(period=period, limit=10)
@@ -627,7 +712,7 @@ async def display_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE
             
     # Send as a new message if it's a command, or edit if it's a callback
     if update.callback_query:
-        await update.callback_query.edit_message_text(message, reply_markup=get_leaderboard_menu_keyboard(), parse_mode='Markdown')
+        await safe_edit_message(update, message, reply_markup=get_leaderboard_menu_keyboard(), parse_mode="Markdown")
     else:
         await update.message.reply_text(message, reply_markup=get_leaderboard_menu_keyboard(), parse_mode='Markdown')
 
@@ -850,7 +935,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     chat_id = query.message.chat_id
     
     if query.data == "back_to_start":
-        await query.edit_message_text(
+        await safe_edit_message(query,
             "👋 *Hello! I'm* **WordRush Bot** 🤖\n"
             "-------------------------------------\n"
             "The **Ultimate Word Challenge** on Telegram!\n\n"
@@ -863,7 +948,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
     
     elif query.data == "show_help_menu":
-        await query.edit_message_text(
+        await safe_edit_message(query,
             "📖 **WordRush Help Center**\n"
             "-------------------------------------\n"
             "*Choose a topic below to get assistance.*\n"
@@ -883,7 +968,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "   • 🔴 *Red* = Letter **Not in the Word**.\n\n"
             "3. **The Game:** You have *30 guesses*. The person who wins with the fewest guesses gets the most points! 🥇"
         )
-        await query.edit_message_text(commands_list, reply_markup=get_help_menu_keyboard(), parse_mode='Markdown')
+        await safe_edit_message(query, commands_list, reply_markup=get_help_menu_keyboard(), parse_mode='Markdown')
 
     elif query.data == "show_commands":
         commands_list = (
@@ -895,10 +980,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "• **/end** → *End current game* (Admin Only / DM).\n"
             "• **/difficulty** → *Show difficulty settings* (Admin Only / DM).\n"
         )
-        await query.edit_message_text(commands_list, reply_markup=get_help_menu_keyboard(), parse_mode='Markdown')
+        await safe_edit_message(query, commands_list, reply_markup=get_help_menu_keyboard(), parse_mode='Markdown')
         
     elif query.data == "show_leaderboard_menu":
-        await query.edit_message_text(
+        await safe_edit_message(query,
             "🏆 **Leaderboard Selection**\n"
             "-------------------------------------\n"
             "*Select the ranking period you wish to view.*",
@@ -911,7 +996,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await display_leaderboard(update, context, period)
 
     elif query.data == "new_game_menu":
-        await query.edit_message_text(
+        await safe_edit_message(query,
             "🎯 **Select Your Challenge Level:**\n"
             "*Choose the word length and point value.*",
             reply_markup=get_new_game_keyboard(),
@@ -922,7 +1007,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         difficulty = query.data.split('_')[1]
         
         if db_manager and db_manager.get_game_state(chat_id):
-            await query.edit_message_text("⏳ *A game is already active*. Use **/end** to stop it first.")
+            await safe_edit_message(query, "⏳ *A game is already active*. Use **/end** to stop it first.")
             return
 
         success, message = await start_new_game_logic(chat_id, difficulty)
@@ -931,9 +1016,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             user_info = f"@{user.username}" if user and user.username else (user.first_name if user else "User")
             log_msg = f"🎮 **New Game Started (Button)**\n🎯 **Difficulty:** {difficulty.capitalize()}\n👤 **Started By:** {user_info}\n💬 **Chat ID:** `{chat_id}`"
             await send_log_notification(context, log_msg)
-            await query.edit_message_text(message, parse_mode='Markdown')
+            await safe_edit_message(query, message, parse_mode='Markdown')
         else:
-            await query.edit_message_text(f"❌ *Game start failed*: {message}", parse_mode='Markdown')
+            await safe_edit_message(query, f"❌ *Game start failed*: {message}", parse_mode='Markdown')
 
 # --- Updated Guess Handler (Handles the new error message) ---
     elif query.data.startswith("groups_page_"):
@@ -1532,12 +1617,8 @@ async def render_groups_page(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     if total_groups == 0:
         msg = "👥 **Joined Groups List:**\n\n*The bot is currently not in any recorded groups.*"
-        if update.callback_query:
-            await update.callback_query.edit_message_text(msg, parse_mode='Markdown')
-        else:
-            await update.effective_message.reply_text(msg, parse_mode='Markdown')
+        await safe_edit_message(update, msg, parse_mode="Markdown")
         return
-
     per_page = 50
     total_pages = (total_groups + per_page - 1) // per_page
     page = max(0, min(page, total_pages - 1))
@@ -1569,10 +1650,7 @@ async def render_groups_page(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
 
-    if update.callback_query:
-        await update.callback_query.edit_message_text(msg_text, reply_markup=reply_markup, parse_mode='Markdown', disable_web_page_preview=True)
-    else:
-        await update.effective_message.reply_text(msg_text, reply_markup=reply_markup, parse_mode='Markdown', disable_web_page_preview=True)
+    await safe_edit_message(update, msg_text, reply_markup=reply_markup, parse_mode="Markdown", disable_web_page_preview=True)
 
 
 async def track_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

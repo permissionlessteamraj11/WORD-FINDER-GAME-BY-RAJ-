@@ -114,5 +114,64 @@ class TestApplicationConfiguration(unittest.TestCase):
         app = create_application(None)
         self.assertIsNone(app)
 
+
+
+class TestSafeEditMessage(unittest.IsolatedAsyncioTestCase):
+    async def test_text_message_edit_success(self):
+        from unittest.mock import AsyncMock, MagicMock
+        from main import safe_edit_message
+        query = MagicMock(spec=['message', 'edit_message_text'])
+        query.message = MagicMock(spec=['text'])
+        query.edit_message_text = AsyncMock()
+
+        await safe_edit_message(query, "Hello World")
+        query.edit_message_text.assert_called_once_with(text="Hello World", parse_mode="Markdown")
+
+    async def test_photo_message_edit_caption(self):
+        from unittest.mock import AsyncMock, MagicMock
+        from main import safe_edit_message
+        query = MagicMock(spec=['message', 'edit_message_caption', 'edit_message_text'])
+        query.message = MagicMock()
+        query.message.photo = ["fake_photo"]
+        query.edit_message_caption = AsyncMock()
+
+        await safe_edit_message(query, "New Caption")
+        query.edit_message_caption.assert_called_once_with(caption="New Caption", parse_mode="Markdown")
+
+    async def test_bad_request_no_text_fallback_to_caption(self):
+        from unittest.mock import AsyncMock, MagicMock
+        from telegram import error
+        from main import safe_edit_message
+        query = MagicMock(spec=['message', 'edit_message_text', 'edit_message_caption'])
+        query.message = MagicMock()
+        query.edit_message_text = AsyncMock(side_effect=error.BadRequest("There is no text in the message to edit"))
+        query.edit_message_caption = AsyncMock()
+
+        await safe_edit_message(query, "Fallback Text")
+        query.edit_message_caption.assert_called_once_with(caption="Fallback Text", parse_mode="Markdown")
+
+    async def test_message_not_modified_ignored(self):
+        from unittest.mock import AsyncMock, MagicMock
+        from telegram import error
+        from main import safe_edit_message
+        query = MagicMock(spec=['message', 'edit_message_text'])
+        query.message = MagicMock()
+        query.edit_message_text = AsyncMock(side_effect=error.BadRequest("Message is not modified: specified new message content and reply markup are exactly the same"))
+
+        await safe_edit_message(query, "Same Text")
+
+    async def test_fallback_to_reply_text_on_failure(self):
+        from unittest.mock import AsyncMock, MagicMock
+        from telegram import error
+        from main import safe_edit_message
+        query = MagicMock(spec=['message', 'edit_message_text', 'edit_message_caption'])
+        query.message = MagicMock()
+        query.message.reply_text = AsyncMock()
+        query.edit_message_text = AsyncMock(side_effect=error.BadRequest("Unknown error"))
+        query.edit_message_caption = AsyncMock(side_effect=error.BadRequest("Unknown error"))
+
+        await safe_edit_message(query, "Fallback Reply")
+        query.message.reply_text.assert_called_once_with(text="Fallback Reply", parse_mode="Markdown")
+
 if __name__ == "__main__":
     unittest.main()
