@@ -39,7 +39,7 @@ DIFFICULTY_CONFIG = {
 }
 
 START_MESSAGE = (
-    "Welcome to WordSeek!\n\n"
+    "✨ Welcome to WordSeek!!\n\n"
     "A fun and competitive Wordle-style game that you can play directly on Telegram.\n\n"
     "<blockquote>"
     "🚀 Quick Start:\n\n"
@@ -486,11 +486,12 @@ async def start_new_game_logic(chat_id: int, difficulty: str) -> Tuple[bool, str
     db_manager.save_game_state(chat_id, initial_state)
     
     return True, (
-        f"**✨ New Word Rush Challenge!**\n"
-        f"-------------------------------------\n"
-        f"🎯 Difficulty: **{difficulty.capitalize()}**\n"
-        f"📜 Word Length: **{length} letters** (Example: `{config['example']}`)\n"
-        f"➡️ *Send your {length}-letter guess directly to the chat!*"
+        f"> **✨ New Word Rush Challenge!**\n"
+        f">\n"
+        f"> -------------------------------------\n"
+        f"> 🎯 Difficulty: **{difficulty.capitalize()}**\n"
+        f"> 📜 Word Length: **{length} letters** (Example: `{config['example']}`)\n"
+        f"> ➡️ *Send your {length}-letter guess directly to the chat!*"
     )
 
 async def process_guess_logic(chat_id: int, guess: str) -> Tuple[str, bool, str, int, List[str]]:
@@ -849,7 +850,9 @@ async def end_game_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await send_log_notification(context, log_msg)
 
     await update.effective_message.reply_text(
-        f"🛑 **Game Ended!**\n*The secret word was:* **`{word}`**.",
+        f"> 🛑 **Game Ended!**\n"
+        f">\n"
+        f"> *The secret word was:* **`{word}`**",
         parse_mode='Markdown'
     )
 
@@ -874,15 +877,19 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     remaining = game_state['max_guesses'] - game_state['guesses_made']
     
+    # Format history display with quote prefix if multi-line
+    quoted_history = "\n".join(f"> {line}" for line in history_display.split("\n"))
     reply_text = (
-        f"**📊 Current Word Rush Status**\n"
-        f"-------------------------------------\n"
-        f"Difficulty: **{game_state['difficulty'].capitalize()}**\n"
-        f"Word Length: **{len(game_state['word'])} letters**\n"
-        f"Guesses: **`{game_state['guesses_made']}`** / **`{game_state['max_guesses']}`**\n"
-        f"Remaining: **`{remaining}`**\n\n"
-        f"📜 **Guess History:**\n"
-        f"{history_display}"
+        f"> **📊 Current Word Rush Status**\n"
+        f">\n"
+        f"> -------------------------------------\n"
+        f"> Difficulty: **{game_state['difficulty'].capitalize()}**\n"
+        f"> Word Length: **{len(game_state['word'])} letters**\n"
+        f"> Guesses: **`{game_state['guesses_made']}`** / **`{game_state['max_guesses']}`**\n"
+        f"> Remaining: **`{remaining}`**\n"
+        f">\n"
+        f"> 📜 **Guess History:**\n"
+        f"{quoted_history}"
     )
     
     await update.message.reply_text(reply_text, parse_mode='Markdown')
@@ -1119,11 +1126,16 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await send_log_notification(context, log_msg)
         
         word_length = len(game_state.get('word', ''))
+        user_mention = f"@{user.username}" if user and user.username else (user.full_name or user.first_name)
+        attempts = len(guess_history)
         reply_text = (
-            f"> Congrats! You guessed it correctly.\n"
-            f"> Correct Word: {word_was.lower()}\n"
-            f"> Added {points} to the leaderboard.\n"
-            f"> Start with /new{word_length}"
+            f"> 🏆 **Congrats! You guessed it correctly.**\n"
+            f">\n"
+            f"> 👤 **Winner:** {user_mention}\n"
+            f"> 🔑 **Correct Word:** `{word_was.lower()}`\n"
+            f"> 🎯 **Score:** +{points} points (in {attempts} attempts)\n"
+            f">\n"
+            f"> ➡️ Start with /new{word_length}"
         )
         reply_markup = get_play_again_keyboard()
 
@@ -1132,26 +1144,33 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         log_msg = f"💔 **Game Over (Loss)**\n👤 **Last Player:** @{username} (`{user.id}`)\n💬 **Chat ID:** `{chat_id}`\n🔑 **Word Was:** `{word_was}`"
         await send_log_notification(context, log_msg)
         
+        quoted_board = "\n".join(f"> {line}" for line in game_history_display.split("\n"))
         reply_text = (
-            f"💔 **GAME OVER! 😭**\n"
-            f"-------------------------------------\n"
-            f"*Maximum guesses reached* (**{game_state['max_guesses']}**).\n\n"
-            f"📜 **Final Board:**\n"
-            f"{game_history_display}\n\n" 
-            f"❌ *The secret word was:* **`{word_was}`**"
+            f"> 💔 **GAME OVER! 😭**\n"
+            f">\n"
+            f"> -------------------------------------\n"
+            f"> *Maximum guesses reached* (**{game_state['max_guesses']}**).\n"
+            f">\n"
+            f"> 📜 **Final Board:**\n"
+            f"{quoted_board}\n"
+            f">\n"
+            f"> ❌ *The secret word was:* **`{word_was}`**"
         )
         reply_markup = get_play_again_keyboard()
 
     else:
         # Ongoing game message (Show full history + status)
-        
+        quoted_board = "\n".join(f"> {line}" for line in game_history_display.split("\n"))
         reply_text = (
-            f"**Word Rush Challenge** 🎯\n"
-            f"-------------------------------------\n"
-            f"Attempts: **`{len(guess_history)}`** / **`{game_state['max_guesses']}`**\n\n"
-            f"📜 **Guess History:**\n"
-            f"{game_history_display}\n\n" 
-            f"👉 {status_message}" # Displays: Guesses left: **27**
+            f"> **Word Rush Challenge** 🎯\n"
+            f">\n"
+            f"> -------------------------------------\n"
+            f"> Attempts: **`{len(guess_history)}`** / **`{game_state['max_guesses']}`**\n"
+            f">\n"
+            f"> 📜 **Guess History:**\n"
+            f"{quoted_board}\n"
+            f">\n"
+            f"> 👉 {status_message}"
         )
     
     await update.message.reply_text(
