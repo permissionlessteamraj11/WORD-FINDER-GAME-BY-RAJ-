@@ -41,10 +41,12 @@ DIFFICULTY_CONFIG = {
 START_MESSAGE = (
     "✨ Welcome to WordSeek!!\n\n"
     "A fun and competitive Wordle-style game that you can play directly on Telegram.\n\n"
-    "<blockquote expandable>🚀 Quick Start:\n"
+    "<blockquote>"
+    "🚀 Quick Start:\n"
     "• Use /new to start a new game\n"
     "• Add me to a group with admin permissions to play with friends\n"
-    "• Use /help for detailed instructions and command list</blockquote>\n\n"
+    "• Use /help for detailed instructions and command list"
+    "</blockquote>\n\n"
     "Ready to test your word skills? Let's play!"
 )
 # --- Log Channel Configuration ---
