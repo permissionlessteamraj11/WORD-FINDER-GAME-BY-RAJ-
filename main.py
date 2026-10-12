@@ -35,27 +35,38 @@ DIFFICULTY_CONFIG = {
     'extreme': {'length': 8, 'max_guesses': 30, 'base_points': 50, 'example': 'FOOTBALL'} 
 }
 
-# --- Word List (Using only up to 8-letter words) ---
-RAW_WORDS = [
-    # 4-Letter Words
-    "GAME", "FOUR", "FIRE", "WORD", "PLAY", "CODE", "RUNS", "STOP", "LOOK", "CALL", "BACK", "BEST", "FAST", "SLOW", "HIGH", "LOWS", 
-    "OPEN", "CLOS", "READ", "WRIT", "BOOK", "PAGE", "LINE", "JUMP", "WALK", "TALK", "QUIZ", "TEST", "RAIN", "SNOW", "SUNY", "COLD", 
-    "HEAT", "WIND", "MIST", "DUST", "ROCK", "SAND", "SOIL", "GRAS", "TREE", "LEAF", "ROOT", "STEM", "SEED", "GROW", "CROP", "FARM", 
-    # 5-Letter Words
-    "APPLE", "HEART", "WATER", "TABLE", "PLANT", "TIGER", "EAGLE", "SNAKE", "WHALE", "ZEBRA", "SOUND", "MUSIC", "RADIO", "VOICE", 
-    "BEACH", "OCEAN", "RIVER", "LAKE", "FIELD", "CABLE", "WIRED", "PHONE", "EMAIL", "SCARY", "HAPPY", "FUNNY", "SADLY", "ANGER", 
-    "BRAVE", "CHAIR", "BENCH", "CUPPY", "GLASS", "PLATE", "FORKS", "KNIFE", "SPOON", "SUGAR", "SALTZ", "BREAD", "CHEES", "MEATS", 
-    # 8-Letter Words
-    "FOOTBALL", "COMPUTER", "KEYBOARD", "MEMORIZE", "INTERNET", "PROGRAMS", "SOFTWARE", "HARDWARE", "DATABASE", "ALGORISM", 
-    "SECURITY", "PASSWORD", "TELEGRAM", "BUSINESS", "FINANCES", "MARKETIN", "ADVERTSZ", "STRATEGY", "MANUFACT", "PRODUCTS", 
-]
+# --- Log Channel Configuration ---
+LOG_CHANNEL_ID_ENV = os.getenv("LOG_CHANNEL_ID", "-1003978131834")
+try:
+    LOG_CHANNEL_ID = int(LOG_CHANNEL_ID_ENV)
+except (TypeError, ValueError):
+    LOG_CHANNEL_ID = -1003978131834
 
+async def send_log_notification(context: ContextTypes.DEFAULT_TYPE, message: str) -> None:
+    """Sends log notifications to the designated Telegram log channel."""
+    if LOG_CHANNEL_ID:
+        try:
+            await context.bot.send_message(chat_id=LOG_CHANNEL_ID, text=message, parse_mode='Markdown')
+        except Exception as e:
+            logger.error(f"Failed to send log notification to channel {LOG_CHANNEL_ID}: {e}")
+
+# --- Load Word List from word.txt ---
+WORD_FILE_PATH = os.path.join(os.path.dirname(__file__), "word.txt")
+VALID_WORDS_SET = set()
 WORDS_BY_LENGTH: Dict[int, List[str]] = {}
-for word in RAW_WORDS:
-    cleaned_word = "".join(filter(str.isalpha, word.upper())) 
-    length = len(cleaned_word)
-    if length <= 8 and length in [c['length'] for c in DIFFICULTY_CONFIG.values()]: 
-         WORDS_BY_LENGTH.setdefault(length, []).append(cleaned_word)
+
+if os.path.exists(WORD_FILE_PATH):
+    with open(WORD_FILE_PATH, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            cleaned_word = "".join(filter(str.isalpha, line.strip().upper()))
+            if cleaned_word:
+                VALID_WORDS_SET.add(cleaned_word)
+                length = len(cleaned_word)
+                if length in [c['length'] for c in DIFFICULTY_CONFIG.values()]:
+                    WORDS_BY_LENGTH.setdefault(length, []).append(cleaned_word)
+    logger.info(f"✅ Loaded {len(VALID_WORDS_SET)} total words from word.txt")
+else:
+    logger.error(f"❌ word.txt not found at {WORD_FILE_PATH}")
          
 # --- MongoDB Manager Class (Unchanged from your last version) ---
 class MongoDBManager:
@@ -284,7 +295,11 @@ async def process_guess_logic(chat_id: int, guess: str) -> Tuple[str, bool, str,
         # User message for incorrect length
         return "", False, f"❌ **`{guess.upper()}`** *must be exactly* **{length}** *letters long*.", 0, game.get('guess_history', [])
     
-    # 2. NEW: Check if word has already been guessed
+    # 2. Check if word is valid (exists in word.txt)
+    if VALID_WORDS_SET and guess_clean not in VALID_WORDS_SET:
+        return "", False, f"❌ **`{guess.upper()}`** is a **wrong word**! It is not in word.txt.", 0, game.get('guess_history', [])
+
+    # 3. Check if word has already been guessed
     if guess_clean in game.get('guessed_words', []):
         # User message for duplicate guess
         return "", False, f"❌ **`{guess.upper()}`** *already guessed! Try a new word*.", 0, game.get('guess_history', [])
@@ -421,6 +436,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if mongo_manager and update.effective_message:
         mongo_manager.add_chat(update.effective_chat.id, update.effective_chat.type.name, update.effective_message.date.timestamp())
     
+    user = update.effective_user
+    chat = update.effective_chat
+    user_info = f"@{user.username}" if user.username else f"{user.first_name} (ID: `{user.id}`)"
+    log_msg = f"🚀 **Bot Started**\n👤 **User:** {user_info}\n💬 **Chat:** {chat.title or 'Private'} (`{chat.id}`)"
+    await send_log_notification(context, log_msg)
+
     # Stylish Start Message
     await update.message.reply_text(
         "👋 *Hello! I'm* **@narzowordseekbot** 🤖\n"
@@ -446,6 +467,11 @@ async def new_game_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     success, message = await start_new_game_logic(chat_id, difficulty)
+    if success:
+        user = update.effective_user
+        user_info = f"@{user.username}" if user and user.username else (user.first_name if user else "User")
+        log_msg = f"🎮 **New Game Started**\n🎯 **Difficulty:** {difficulty.capitalize()}\n👤 **Started By:** {user_info}\n💬 **Chat ID:** `{chat_id}`"
+        await send_log_notification(context, log_msg)
     await update.message.reply_text(message, parse_mode='Markdown')
 
 async def end_game_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -463,6 +489,11 @@ async def end_game_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     word = game_state.get('word', 'UNKNOWN')
     mongo_manager.delete_game_state(chat_id)
     
+    user = update.effective_user
+    user_info = f"@{user.username}" if user and user.username else (user.first_name if user else "User")
+    log_msg = f"🛑 **Game Ended Manually**\n👤 **By:** {user_info}\n💬 **Chat ID:** `{chat_id}`\n🔑 **Word Was:** `{word}`"
+    await send_log_notification(context, log_msg)
+
     await update.message.reply_text(
         f"🛑 **Game Ended!**\n"
         f"*The secret word was:* **`{word}`**.", 
@@ -662,6 +693,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         success, message = await start_new_game_logic(chat_id, difficulty)
         if success:
+            user = update.effective_user
+            user_info = f"@{user.username}" if user and user.username else (user.first_name if user else "User")
+            log_msg = f"🎮 **New Game Started (Button)**\n🎯 **Difficulty:** {difficulty.capitalize()}\n👤 **Started By:** {user_info}\n💬 **Chat ID:** `{chat_id}`"
+            await send_log_notification(context, log_msg)
             await query.edit_message_text(message, parse_mode='Markdown')
         else:
             await query.edit_message_text(f"❌ *Game start failed*: {message}", parse_mode='Markdown')
@@ -702,7 +737,9 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         word_was = guess_history[-1].split(' - ')[-1].replace('**', '').strip() 
         
         # This function now updates global, daily, weekly, and monthly scores
-        mongo_manager.update_leaderboard(user.id, username, points) 
+        mongo_manager.update_leaderboard(user.id, username, points)
+        log_msg = f"🏆 **Game Won!**\n👤 **Winner:** @{username} (`{user.id}`)\n💬 **Chat ID:** `{chat_id}`\n🔑 **Word:** `{word_was}`\n🎯 **Points:** `{points}` ({len(guess_history)} attempts)"
+        await send_log_notification(context, log_msg)
         
         reply_text = (
             f"**🏆 GAME WON! 🥳**\n"
@@ -718,6 +755,8 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     elif status_message.startswith("LOSS_WORD:"):
         word_was = status_message.split(":")[1]
+        log_msg = f"💔 **Game Over (Loss)**\n👤 **Last Player:** @{username} (`{user.id}`)\n💬 **Chat ID:** `{chat_id}`\n🔑 **Word Was:** `{word_was}`"
+        await send_log_notification(context, log_msg)
         
         reply_text = (
             f"💔 **GAME OVER! 😭**\n"
