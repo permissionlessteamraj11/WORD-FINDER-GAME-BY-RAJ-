@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, error
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.request import HTTPXRequest
 from telegram.constants import ChatType
 from typing import Dict, List, Tuple
 import json
@@ -820,41 +821,81 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 # --- Main Bot Runner ---
 
-def main():
-    """Start the bot."""
-    if not BOT_TOKEN:
-        logger.error("FATAL ERROR: BOT_TOKEN not found. Please set it in the .env file.")
-        return
-    
-    application = Application.builder().token(BOT_TOKEN).build()
+# --- Network / Timeout Settings ---
+HTTP_CONNECT_TIMEOUT = float(os.getenv("HTTP_CONNECT_TIMEOUT", "30.0"))
+HTTP_READ_TIMEOUT = float(os.getenv("HTTP_READ_TIMEOUT", "30.0"))
+HTTP_WRITE_TIMEOUT = float(os.getenv("HTTP_WRITE_TIMEOUT", "30.0"))
+HTTP_POOL_TIMEOUT = float(os.getenv("HTTP_POOL_TIMEOUT", "10.0"))
+BOOTSTRAP_RETRIES = int(os.getenv("BOOTSTRAP_RETRIES", "5"))
+
+def create_application(token: str = BOT_TOKEN) -> Application | None:
+    """Builds and configures the Telegram Application instance."""
+    if not token:
+        return None
+
+    request = HTTPXRequest(
+        connect_timeout=HTTP_CONNECT_TIMEOUT,
+        read_timeout=HTTP_READ_TIMEOUT,
+        write_timeout=HTTP_WRITE_TIMEOUT,
+        pool_timeout=HTTP_POOL_TIMEOUT,
+        http_version="1.1"
+    )
+    get_updates_request = HTTPXRequest(
+        connect_timeout=HTTP_CONNECT_TIMEOUT,
+        read_timeout=HTTP_READ_TIMEOUT,
+        write_timeout=HTTP_WRITE_TIMEOUT,
+        pool_timeout=HTTP_POOL_TIMEOUT,
+        http_version="1.1"
+    )
+
+    app = (
+        Application.builder()
+        .token(token)
+        .request(request)
+        .get_updates_request(get_updates_request)
+        .build()
+    )
 
     # Register Handlers
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("new", new_game_command))
-    application.add_handler(CommandHandler("end", end_game_command))
-    application.add_handler(CommandHandler("leaderboard", leaderboard_command))
-    application.add_handler(CommandHandler("difficulty", difficulty_command)) 
-    application.add_handler(CommandHandler("status", status_command)) 
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("new", new_game_command))
+    app.add_handler(CommandHandler("end", end_game_command))
+    app.add_handler(CommandHandler("leaderboard", leaderboard_command))
+    app.add_handler(CommandHandler("difficulty", difficulty_command))
+    app.add_handler(CommandHandler("status", status_command))
     
     if ADMIN_USER_ID != 0 and db_manager is not None:
-        application.add_handler(CommandHandler("broadcast", broadcast_command))
+        app.add_handler(CommandHandler("broadcast", broadcast_command))
     
-    application.add_handler(CommandHandler("help", start_command)) 
+    app.add_handler(CommandHandler("help", start_command))
 
     # Callback query handler for inline buttons
-    application.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(CallbackQueryHandler(callback_handler))
     
     # Message handler for guesses:
-    application.add_handler(
+    app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND & filters.Regex(r'^[a-zA-Z]{1,8}$'), 
             handle_guess
         )
     )
 
+    return app
+
+def main():
+    """Start the bot."""
+    if not BOT_TOKEN:
+        logger.error("FATAL ERROR: BOT_TOKEN not found. Please set it in the .env file.")
+        return
+
+    application = create_application(BOT_TOKEN)
+
     logger.info("🚀 WordRush Bot is running (Guess Uniqueness & Leaderboards Ready)...")
     
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        bootstrap_retries=BOOTSTRAP_RETRIES
+    )
 
 if __name__ == "__main__":
     main()
