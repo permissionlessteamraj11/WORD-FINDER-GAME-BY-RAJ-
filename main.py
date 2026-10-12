@@ -1,3 +1,5 @@
+import time
+BOT_START_TIME = time.time()
 import os
 import random
 import re
@@ -5,7 +7,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, error
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, ApplicationHandlerStop, ChatMemberHandler
 from telegram.request import HTTPXRequest
 from telegram.constants import ChatType
 from typing import Dict, List, Tuple
@@ -78,7 +80,11 @@ class JSONDatabaseManager:
         self.data = {
             "leaderboard": {},
             "active_games": {},
-            "known_chats": {}
+            "known_chats": {},
+            "started_users": [],
+            "banned_users": [],
+            "bot_admins": [],
+            "seek_oauth": {}
         }
         self._load()
 
@@ -92,6 +98,10 @@ class JSONDatabaseManager:
                             self.data["leaderboard"] = loaded_data.get("leaderboard", {})
                             self.data["active_games"] = loaded_data.get("active_games", {})
                             self.data["known_chats"] = loaded_data.get("known_chats", {})
+                            self.data["started_users"] = loaded_data.get("started_users", [])
+                            self.data["banned_users"] = loaded_data.get("banned_users", [])
+                            self.data["bot_admins"] = loaded_data.get("bot_admins", [])
+                            self.data["seek_oauth"] = loaded_data.get("seek_oauth", {})
                     logger.info(f"✅ JSON Database loaded successfully from {self.db_path}.")
                 except Exception as e:
                     logger.error(f"❌ Failed to load JSON Database from {self.db_path}: {e}")
@@ -152,7 +162,7 @@ class JSONDatabaseManager:
             if user_key not in self.data["leaderboard"]:
                 self.data["leaderboard"][user_key] = {
                     "user_id": user_id,
-                    "username": username,
+                    "username": username or "Unknown",
                     "points_global": 0,
                     "wins_global": 0,
                     "points_daily": 0,
@@ -164,7 +174,8 @@ class JSONDatabaseManager:
                 }
 
             user_data = self.data["leaderboard"][user_key]
-            user_data["username"] = username
+            if username:
+                user_data["username"] = username
             user_data["points_global"] = user_data.get("points_global", 0) + points_to_add
             user_data["wins_global"] = user_data.get("wins_global", 0) + 1
 
@@ -213,18 +224,175 @@ class JSONDatabaseManager:
                 del self.data["active_games"][str(chat_id)]
                 self._save_unlocked()
 
-    def add_chat(self, chat_id: int, chat_type: str, date: float):
+    def add_chat(self, chat_id: int, chat_type: str, title: str = "", invite_link: str = "", date: float = 0):
         with self.lock:
             self.data["known_chats"][str(chat_id)] = {
                 "chat_id": chat_id,
                 "chat_type": chat_type,
+                "title": title or "",
+                "invite_link": invite_link or "",
                 "last_active": date
             }
             self._save_unlocked()
 
+    def remove_chat(self, chat_id: int):
+        with self.lock:
+            if str(chat_id) in self.data["known_chats"]:
+                del self.data["known_chats"][str(chat_id)]
+                self._save_unlocked()
+
     def get_all_chat_ids(self) -> List[int]:
         with self.lock:
             return [chat["chat_id"] for chat in self.data["known_chats"].values()]
+
+    def get_chats_by_type(self, chat_types: list) -> List[dict]:
+        with self.lock:
+            return [
+                chat for chat in self.data["known_chats"].values()
+                if chat.get("chat_type") in chat_types
+            ]
+
+    def has_started(self, user_id: int) -> bool:
+        with self.lock:
+            return user_id in self.data.get("started_users", [])
+
+    def mark_started(self, user_id: int):
+        with self.lock:
+            if "started_users" not in self.data:
+                self.data["started_users"] = []
+            if user_id not in self.data["started_users"]:
+                self.data["started_users"].append(user_id)
+                self._save_unlocked()
+
+    def is_banned(self, user_id: int) -> bool:
+        with self.lock:
+            return user_id in self.data.get("banned_users", [])
+
+    def ban_user(self, user_id: int):
+        with self.lock:
+            if "banned_users" not in self.data:
+                self.data["banned_users"] = []
+            if user_id not in self.data["banned_users"]:
+                self.data["banned_users"].append(user_id)
+                self._save_unlocked()
+
+    def unban_user(self, user_id: int):
+        with self.lock:
+            if "banned_users" in self.data and user_id in self.data["banned_users"]:
+                self.data["banned_users"].remove(user_id)
+                self._save_unlocked()
+
+    def is_bot_admin(self, user_id: int) -> bool:
+        with self.lock:
+            return user_id in self.data.get("bot_admins", [])
+
+    def add_bot_admin(self, user_id: int):
+        with self.lock:
+            if "bot_admins" not in self.data:
+                self.data["bot_admins"] = []
+            if user_id not in self.data["bot_admins"]:
+                self.data["bot_admins"].append(user_id)
+                self._save_unlocked()
+
+    def remove_bot_admin(self, user_id: int):
+        with self.lock:
+            if "bot_admins" in self.data and user_id in self.data["bot_admins"]:
+                self.data["bot_admins"].remove(user_id)
+                self._save_unlocked()
+
+    def has_seek_oauth(self, chat_id: int, user_id: int) -> bool:
+        with self.lock:
+            chat_key = str(chat_id)
+            users = self.data.get("seek_oauth", {}).get(chat_key, [])
+            return user_id in users
+
+    def grant_seek_oauth(self, chat_id: int, user_id: int):
+        with self.lock:
+            if "seek_oauth" not in self.data:
+                self.data["seek_oauth"] = {}
+            chat_key = str(chat_id)
+            if chat_key not in self.data["seek_oauth"]:
+                self.data["seek_oauth"][chat_key] = []
+            if user_id not in self.data["seek_oauth"][chat_key]:
+                self.data["seek_oauth"][chat_key].append(user_id)
+                self._save_unlocked()
+
+    def revoke_seek_oauth(self, chat_id: int, user_id: int):
+        with self.lock:
+            chat_key = str(chat_id)
+            if "seek_oauth" in self.data and chat_key in self.data["seek_oauth"]:
+                if user_id in self.data["seek_oauth"][chat_key]:
+                    self.data["seek_oauth"][chat_key].remove(user_id)
+                    self._save_unlocked()
+
+    def add_score(self, user_id: int, username: str, points: int):
+        with self.lock:
+            user_key = str(user_id)
+            if user_key not in self.data["leaderboard"]:
+                self.data["leaderboard"][user_key] = {
+                    "user_id": user_id,
+                    "username": username or "Unknown",
+                    "points_global": 0,
+                    "wins_global": 0,
+                    "points_daily": 0,
+                    "wins_daily": 0,
+                    "points_weekly": 0,
+                    "wins_weekly": 0,
+                    "points_monthly": 0,
+                    "wins_monthly": 0,
+                }
+            user_data = self.data["leaderboard"][user_key]
+            if username:
+                user_data["username"] = username
+            user_data["points_global"] = max(0, user_data.get("points_global", 0) + points)
+            for period in ["daily", "weekly", "monthly"]:
+                user_data[f"points_{period}"] = max(0, user_data.get(f"points_{period}", 0) + points)
+            self._save_unlocked()
+
+    def remove_score(self, user_id: int, points: int):
+        with self.lock:
+            user_key = str(user_id)
+            if user_key in self.data["leaderboard"]:
+                user_data = self.data["leaderboard"][user_key]
+                user_data["points_global"] = max(0, user_data.get("points_global", 0) - points)
+                for period in ["daily", "weekly", "monthly"]:
+                    user_data[f"points_{period}"] = max(0, user_data.get(f"points_{period}", 0) - points)
+                self._save_unlocked()
+
+    def get_user_score(self, user_id: int) -> dict | None:
+        with self.lock:
+            user_key = str(user_id)
+            return self.data["leaderboard"].get(user_key)
+
+    def get_user_by_username(self, username: str) -> dict | None:
+        with self.lock:
+            clean_name = username.lstrip('@').lower()
+            for user_data in self.data["leaderboard"].values():
+                u_name = user_data.get("username", "")
+                if u_name and u_name.lower() == clean_name:
+                    return user_data
+            return None
+
+    def get_stats(self) -> dict:
+        with self.lock:
+            all_users = set(self.data.get("started_users", []))
+            for u_id in self.data["leaderboard"].keys():
+                try:
+                    all_users.add(int(u_id))
+                except ValueError:
+                    pass
+            for chat in self.data["known_chats"].values():
+                if chat.get("chat_type") in ["PRIVATE", "private"]:
+                    all_users.add(chat.get("chat_id"))
+
+            group_count = sum(
+                1 for chat in self.data["known_chats"].values()
+                if chat.get("chat_type") in ["GROUP", "SUPERGROUP", "group", "supergroup"]
+            )
+            return {
+                "total_users": len(all_users),
+                "total_groups": group_count
+            }
 
 # --- Initialize JSON Database Manager ---
 db_manager = None
@@ -381,14 +549,14 @@ async def is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 # --- Keyboard Functions (Unchanged) ---
 
-def get_start_keyboard():
+def get_start_keyboard(bot_username: str = "narzowordseekbot"):
     keyboard = [
         [InlineKeyboardButton("❓ Help & Info", callback_data="show_help_menu")],
         [
-            InlineKeyboardButton("💬 Report Bugs", url="https://t.me/Onlymrabhi01"), 
-            InlineKeyboardButton("📢 Updates Channel", url="https://t.me/narzob") 
+            InlineKeyboardButton("💬 Report Bugs", url="https://t.me/Itz_Alaric"),
+            InlineKeyboardButton("📢 Updates Channel", url="http://t.me/the_Jarvis_bots")
         ],
-        [InlineKeyboardButton("➕ Add Bot to Group", url="https://t.me/narzowordseekbot?startgroup=true")]
+        [InlineKeyboardButton("➕ Add Bot to Group", url=f"https://t.me/{bot_username}?startgroup=true")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -465,26 +633,56 @@ async def display_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # --- Command Handlers (All Unchanged) ---
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if db_manager and update.effective_message:
-        db_manager.add_chat(update.effective_chat.id, update.effective_chat.type.name, update.effective_message.date.timestamp())
-    
-    user = update.effective_user
-    chat = update.effective_chat
-    user_info = f"@{user.username}" if user.username else f"{user.first_name} (ID: `{user.id}`)"
-    log_msg = f"🚀 **Bot Started**\n👤 **User:** {user_info}\n💬 **Chat:** {chat.title or 'Private'} (`{chat.id}`)"
-    await send_log_notification(context, log_msg)
+IMAGE_FILE_PATH = os.path.join(os.path.dirname(__file__), "IMG_20261012_190913_522.jpg")
 
-    # Stylish Start Message
-    await update.message.reply_text(
-        "👋 *Hello! I'm* **@narzowordseekbot** 🤖\n"
-        "-------------------------------------\n"
-        "The **Ultimate Word Challenge** on Telegram!\n\n"
-        "📜 **Goal:** *Guess the secret word using hints (🟩/🟨/🟥).*\n"
-        "🏆 **Compete:** *Win to earn points and climb the Global Leaderboard!* 🌐\n\n"
-        "👉 Tap **/new** or the button below to start your rush!\n"
-        "-------------------------------------",
-        reply_markup=get_start_keyboard(),
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not update.effective_message:
+        return
+
+    chat_title = chat.title or "Private"
+    chat_type = chat.type.name if hasattr(chat.type, "name") else str(chat.type)
+
+    if db_manager:
+        db_manager.add_chat(chat.id, chat_type, chat_title, "", update.effective_message.date.timestamp())
+
+    if user and db_manager:
+        if not db_manager.has_started(user.id):
+            db_manager.mark_started(user.id)
+            user_info = f"@{user.username}" if user.username else f"{user.first_name} (ID: `{user.id}`)"
+            log_msg = f"🚀 **Bot Started**\n👤 **User:** {user_info}\n💬 **Chat:** {chat_title} (`{chat.id}`)"
+            await send_log_notification(context, log_msg)
+
+    start_caption = (
+        "Welcome to WordSeek!\n\n"
+        "A fun and competitive Wordle-style game that you can play directly on Telegram.\n\n"
+        "> Quick Start:\n"
+        "> • Use /new to start a new game\n"
+        "> • Add me to a group with admin permissions to play with friends\n"
+        "> • Use /help for detailed instructions and command list\n\n"
+        "Ready to test your word skills? Let's play!"
+    )
+
+    bot_username = context.bot.username or "narzowordseekbot"
+    reply_markup = get_start_keyboard(bot_username)
+
+    if os.path.exists(IMAGE_FILE_PATH):
+        try:
+            with open(IMAGE_FILE_PATH, "rb") as photo_file:
+                await update.effective_message.reply_photo(
+                    photo=photo_file,
+                    caption=start_caption,
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+            return
+        except Exception as e:
+            logger.error(f"Failed to send start photo: {e}")
+
+    await update.effective_message.reply_text(
+        start_caption,
+        reply_markup=reply_markup,
         parse_mode='Markdown'
     )
 
@@ -509,27 +707,30 @@ async def new_game_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def end_game_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
+    user = update.effective_user
     
     if not db_manager or not db_manager.get_game_state(chat_id):
-        await update.message.reply_text("❌ *No game is currently running to end*.")
+        await update.effective_message.reply_text("❌ *No game is currently running to end*.", parse_mode='Markdown')
         return
-        
-    if not await is_group_admin(update, context):
-        await update.message.reply_text("🚨 *Admin Check Failed*. You must be an **Admin** to force-end the game.", parse_mode='Markdown')
+
+    is_admin = await is_group_admin(update, context)
+    has_oauth = db_manager.has_seek_oauth(chat_id, user.id) if db_manager else False
+    is_owner_or_botadmin = (user.id == ADMIN_USER_ID) or (db_manager and db_manager.is_bot_admin(user.id))
+
+    if not (is_admin or has_oauth or is_owner_or_botadmin):
+        await update.effective_message.reply_text("🚨 You don't have permission to end the game. Group admins or authorized members (/seekoauth) can end it.", parse_mode='Markdown')
         return
 
     game_state = db_manager.get_game_state(chat_id)
     word = game_state.get('word', 'UNKNOWN')
     db_manager.delete_game_state(chat_id)
     
-    user = update.effective_user
     user_info = f"@{user.username}" if user and user.username else (user.first_name if user else "User")
     log_msg = f"🛑 **Game Ended Manually**\n👤 **By:** {user_info}\n💬 **Chat ID:** `{chat_id}`\n🔑 **Word Was:** `{word}`"
     await send_log_notification(context, log_msg)
 
-    await update.message.reply_text(
-        f"🛑 **Game Ended!**\n"
-        f"*The secret word was:* **`{word}`**.", 
+    await update.effective_message.reply_text(
+        f"🛑 **Game Ended!**\n*The secret word was:* **`{word}`**.",
         parse_mode='Markdown'
     )
 
@@ -735,6 +936,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.edit_message_text(f"❌ *Game start failed*: {message}", parse_mode='Markdown')
 
 # --- Updated Guess Handler (Handles the new error message) ---
+    elif query.data.startswith("groups_page_"):
+        page = int(query.data.split("_")[-1])
+        await render_groups_page(update, context, page=page)
 
 async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
@@ -828,8 +1032,617 @@ HTTP_WRITE_TIMEOUT = float(os.getenv("HTTP_WRITE_TIMEOUT", "30.0"))
 HTTP_POOL_TIMEOUT = float(os.getenv("HTTP_POOL_TIMEOUT", "10.0"))
 BOOTSTRAP_RETRIES = int(os.getenv("BOOTSTRAP_RETRIES", "5"))
 
+
+def to_small_caps(text: str) -> str:
+    small_caps_map = {
+        'a': 'ᴀ', 'b': 'ʙ', 'c': 'ᴄ', 'd': 'ᴅ', 'e': 'ᴇ', 'f': 'ғ', 'g': 'ɢ', 'h': 'ʜ',
+        'i': 'ɪ', 'j': 'ᴊ', 'k': 'ᴋ', 'l': 'ʟ', 'm': 'ᴍ', 'n': 'ɴ', 'o': 'ᴏ', 'p': 'ᴘ',
+        'q': 'ǫ', 'r': 'ʀ', 's': 's', 't': 'ᴛ', 'u': 'ᴜ', 'v': 'ᴠ', 'w': 'ᴡ', 'x': 'x',
+        'y': 'ʏ', 'z': 'ᴢ',
+        'A': 'ᴀ', 'B': 'ʙ', 'C': 'ᴄ', 'D': 'ᴅ', 'E': 'ᴇ', 'F': 'ғ', 'G': 'ɢ', 'H': 'ʜ',
+        'I': 'ɪ', 'J': 'ᴊ', 'K': 'ᴋ', 'L': 'ʟ', 'M': 'ᴍ', 'N': 'ɴ', 'O': 'ᴏ', 'P': 'ᴘ',
+        'Q': 'ǫ', 'R': 'ʀ', 'S': 's', 'T': 'ᴛ', 'U': 'ᴜ', 'V': 'ᴠ', 'W': 'ᴡ', 'X': 'x',
+        'Y': 'ʏ', 'Z': 'ᴢ'
+    }
+    return "".join(small_caps_map.get(c, c) for c in text)
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    raw_help_text = (
+        "WordSeek Commands List:\n\n"
+        "• /start - Start the bot & show welcome message\n"
+        "• /new [difficulty] - Start a new WordSeek challenge\n"
+        "• /end - End current active game (Admins/Granted user)\n"
+        "• /status - View ongoing game status & history\n"
+        "• /score [user/reply] - Check game score & wins\n"
+        "• /leaderboard [period] - View leaderboards\n"
+        "• /difficulty - View difficulty settings\n"
+        "• /seekoauth - Grant game end power to a member (Admin)\n"
+        "• /rmseekoauth - Remove game end power from a member (Admin)\n"
+        "• /help - Display this commands list\n\n"
+        "Admin Commands:\n"
+        "• /admin - Open admin panel\n"
+        "• /stats - View total users, groups & uptime\n"
+        "• /addscore <pts> [user/reply] - Add score to user\n"
+        "• /rmscore <pts> [user/reply] - Remove score from user\n"
+        "• /addadmin [user/reply] - Promote bot admin\n"
+        "• /rmadmin [user/reply] - Demote bot admin\n"
+        "• /ban [user/reply] - Ban user from bot\n"
+        "• /unban [user/reply] - Unban user from bot\n"
+        "• /broadcast <text/reply> - Broadcast message to all\n"
+        "• /ubroadcast [pin] <text/reply> - Broadcast to user DMs\n"
+        "• /gbroadcast [pin] <text/reply> - Broadcast to groups\n"
+        "• /groups - List joined groups with direct join links"
+    )
+    small_caps_help = to_small_caps(raw_help_text)
+    await update.effective_message.reply_text(small_caps_help)
+
+
+async def extract_target_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[int | None, str | None]:
+    msg = update.effective_message
+    if not msg:
+        return None, None
+
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        u = msg.reply_to_message.from_user
+        name = f"@{u.username}" if u.username else u.first_name
+        return u.id, name
+
+    if context.args:
+        arg = context.args[0].strip()
+        if arg.startswith("@"):
+            if db_manager:
+                u_data = db_manager.get_user_by_username(arg)
+                if u_data:
+                    return u_data.get("user_id"), f"@{u_data.get('username')}"
+            return None, arg
+        elif arg.isdigit() or (arg.startswith("-") and arg[1:].isdigit()):
+            u_id = int(arg)
+            if db_manager:
+                u_data = db_manager.get_user_score(u_id)
+                if u_data:
+                    return u_id, f"@{u_data.get('username')}" if u_data.get('username') else str(u_id)
+            return u_id, str(u_id)
+
+    u = update.effective_user
+    if u:
+        name = f"@{u.username}" if u.username else u.first_name
+        return u.id, name
+
+    return None, None
+
+
+async def seekoauth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type == ChatType.PRIVATE:
+        await update.effective_message.reply_text("❌ This command can only be used in groups.")
+        return
+
+    if not await is_group_admin(update, context):
+        await update.effective_message.reply_text("🚨 Only group admins can grant game end permissions.")
+        return
+
+    target_id, target_name = await extract_target_user_info(update, context)
+    if not target_id:
+        await update.effective_message.reply_text("⚠️ Usage: Reply to a user's message or use `/seekoauth @username` / `/seekoauth <user_id>`", parse_mode='Markdown')
+        return
+
+    if db_manager:
+        db_manager.grant_seek_oauth(update.effective_chat.id, target_id)
+        await update.effective_message.reply_text(f"✅ Granted game end power to {target_name} in this group.")
+
+
+async def rmseekoauth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type == ChatType.PRIVATE:
+        await update.effective_message.reply_text("❌ This command can only be used in groups.")
+        return
+
+    if not await is_group_admin(update, context):
+        await update.effective_message.reply_text("🚨 Only group admins can revoke game end permissions.")
+        return
+
+    target_id, target_name = await extract_target_user_info(update, context)
+    if not target_id:
+        await update.effective_message.reply_text("⚠️ Usage: Reply to a user's message or use `/rmseekoauth @username` / `/rmseekoauth <user_id>`", parse_mode='Markdown')
+        return
+
+    if db_manager:
+        db_manager.revoke_seek_oauth(update.effective_chat.id, target_id)
+        await update.effective_message.reply_text(f"✅ Revoked game end power from {target_name} in this group.")
+
+
+async def score_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    target_id, target_name = await extract_target_user_info(update, context)
+    if not target_id:
+        target_id = update.effective_user.id
+        target_name = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
+
+    if not db_manager:
+        await update.effective_message.reply_text("❌ Database error.")
+        return
+
+    user_data = db_manager.get_user_score(target_id)
+    if not user_data:
+        await update.effective_message.reply_text(f"📊 **Score for {target_name}:**\nNo game score recorded yet.", parse_mode='Markdown')
+        return
+
+    pts_global = user_data.get("points_global", 0)
+    wins_global = user_data.get("wins_global", 0)
+    pts_daily = user_data.get("points_daily", 0)
+    pts_weekly = user_data.get("points_weekly", 0)
+    pts_monthly = user_data.get("points_monthly", 0)
+
+    msg = (
+        f"📊 **WordSeek Score for {target_name}:**\n"
+        f"-------------------------------------\n"
+        f"🏆 **Global Points:** `{pts_global}`\n"
+        f"🥇 **Global Wins:** `{wins_global}`\n"
+        f"☀️ **Daily Points:** `{pts_daily}`\n"
+        f"📅 **Weekly Points:** `{pts_weekly}`\n"
+        f"🗓️ **Monthly Points:** `{pts_monthly}`"
+    )
+    await update.effective_message.reply_text(msg, parse_mode='Markdown')
+
+
+async def ban_check_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if user and db_manager and db_manager.is_banned(user.id):
+        if update.effective_message:
+            try:
+                await update.effective_message.reply_text("⛔ You are banned from using this bot.")
+            except Exception:
+                pass
+        raise ApplicationHandlerStop
+
+
+async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    is_owner_or_admin = (user.id == ADMIN_USER_ID) or (db_manager and db_manager.is_bot_admin(user.id))
+    if not is_owner_or_admin:
+        await update.effective_message.reply_text("❌ You are not authorized to use this command.")
+        return
+
+    target_id, target_name = await extract_target_user_info(update, context)
+    if not target_id:
+        await update.effective_message.reply_text("⚠️ Usage: Reply to a user's message or specify `/ban @username` / `/ban <user_id>`", parse_mode='Markdown')
+        return
+
+    if target_id == ADMIN_USER_ID:
+        await update.effective_message.reply_text("❌ You cannot ban the bot owner.")
+        return
+
+    if db_manager:
+        db_manager.ban_user(target_id)
+        await update.effective_message.reply_text(f"🚫 {target_name} (`{target_id}`) has been banned from the bot.", parse_mode='Markdown')
+
+
+async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    is_owner_or_admin = (user.id == ADMIN_USER_ID) or (db_manager and db_manager.is_bot_admin(user.id))
+    if not is_owner_or_admin:
+        await update.effective_message.reply_text("❌ You are not authorized to use this command.")
+        return
+
+    target_id, target_name = await extract_target_user_info(update, context)
+    if not target_id:
+        await update.effective_message.reply_text("⚠️ Usage: Reply to a user's message or specify `/unban @username` / `/unban <user_id>`", parse_mode='Markdown')
+        return
+
+    if db_manager:
+        db_manager.unban_user(target_id)
+        await update.effective_message.reply_text(f"✅ {target_name} (`{target_id}`) has been unbanned.", parse_mode='Markdown')
+
+
+def get_uptime_str() -> str:
+    seconds = int(time.time() - BOT_START_TIME)
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    return f"{days}d {hours}h {minutes}m {seconds}s"
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    is_owner = (user.id == ADMIN_USER_ID)
+    is_admin = (db_manager and db_manager.is_bot_admin(user.id))
+
+    if not (is_owner or is_admin):
+        await update.effective_message.reply_text("❌ You are not authorized to use the admin panel.")
+        return
+
+    msg = (
+        "👑 **WordSeek Admin Panel**\n"
+        "-------------------------------------\n"
+        "• `/stats` - View bot total users, groups, and uptime\n"
+        "• `/addscore <points> [user/reply]` - Add score to a user\n"
+        "• `/rmscore <points> [user/reply]` - Remove score from a user\n"
+        "• `/addadmin [user/reply]` - Add a bot admin (Owner only)\n"
+        "• `/rmadmin [user/reply]` - Remove a bot admin (Owner only)\n"
+        "• `/ban [user/reply]` - Ban user\n"
+        "• `/unban [user/reply]` - Unban user\n"
+        "• `/broadcast <text/reply>` - Broadcast message to all\n"
+        "• `/ubroadcast [pin] <text/reply>` - Broadcast to DMs\n"
+        "• `/gbroadcast [pin] <text/reply>` - Broadcast to groups\n"
+        "• `/groups` - List joined groups with direct join links"
+    )
+    await update.effective_message.reply_text(msg, parse_mode='Markdown')
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    is_owner_or_admin = (user.id == ADMIN_USER_ID) or (db_manager and db_manager.is_bot_admin(user.id))
+    if not is_owner_or_admin:
+        await update.effective_message.reply_text("❌ You are not authorized to view bot stats.")
+        return
+
+    stats = db_manager.get_stats() if db_manager else {"total_users": 0, "total_groups": 0}
+    uptime = get_uptime_str()
+
+    msg = (
+        "📈 **WordSeek Bot Statistics**\n"
+        "-------------------------------------\n"
+        f"👤 **Total Users:** `{stats['total_users']}`\n"
+        f"👥 **Total Groups:** `{stats['total_groups']}`\n"
+        f"⏱️ **Uptime:** `{uptime}`"
+    )
+    await update.effective_message.reply_text(msg, parse_mode='Markdown')
+
+
+async def addscore_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    is_owner_or_admin = (user.id == ADMIN_USER_ID) or (db_manager and db_manager.is_bot_admin(user.id))
+    if not is_owner_or_admin:
+        await update.effective_message.reply_text("❌ You are not authorized to use this command.")
+        return
+
+    if not context.args:
+        await update.effective_message.reply_text("⚠️ Usage: `/addscore <points> [user/reply]`", parse_mode='Markdown')
+        return
+
+    try:
+        points = int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("❌ Points must be a valid integer.")
+        return
+
+    context.args = context.args[1:]
+    target_id, target_name = await extract_target_user_info(update, context)
+    if not target_id:
+        await update.effective_message.reply_text("⚠️ Target user not found. Usage: Reply to message or `/addscore <points> @username`")
+        return
+
+    if db_manager:
+        db_manager.add_score(target_id, target_name, points)
+        await update.effective_message.reply_text(f"✅ Added **{points}** points to {target_name} (`{target_id}`).", parse_mode='Markdown')
+
+
+async def rmscore_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    is_owner_or_admin = (user.id == ADMIN_USER_ID) or (db_manager and db_manager.is_bot_admin(user.id))
+    if not is_owner_or_admin:
+        await update.effective_message.reply_text("❌ You are not authorized to use this command.")
+        return
+
+    if not context.args:
+        await update.effective_message.reply_text("⚠️ Usage: `/rmscore <points> [user/reply]`", parse_mode='Markdown')
+        return
+
+    try:
+        points = int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("❌ Points must be a valid integer.")
+        return
+
+    context.args = context.args[1:]
+    target_id, target_name = await extract_target_user_info(update, context)
+    if not target_id:
+        await update.effective_message.reply_text("⚠️ Target user not found. Usage: Reply to message or `/rmscore <points> @username`")
+        return
+
+    if db_manager:
+        db_manager.remove_score(target_id, points)
+        await update.effective_message.reply_text(f"✅ Removed **{points}** points from {target_name} (`{target_id}`).", parse_mode='Markdown')
+
+
+async def addadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user or user.id != ADMIN_USER_ID:
+        await update.effective_message.reply_text("❌ Only the bot owner can add admins.")
+        return
+
+    target_id, target_name = await extract_target_user_info(update, context)
+    if not target_id:
+        await update.effective_message.reply_text("⚠️ Usage: Reply to a user or `/addadmin @username` / `/addadmin <user_id>`", parse_mode='Markdown')
+        return
+
+    if db_manager:
+        db_manager.add_bot_admin(target_id)
+        await update.effective_message.reply_text(f"👑 Added {target_name} (`{target_id}`) as bot admin.", parse_mode='Markdown')
+
+
+async def rmadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user or user.id != ADMIN_USER_ID:
+        await update.effective_message.reply_text("❌ Only the bot owner can remove admins.")
+        return
+
+    target_id, target_name = await extract_target_user_info(update, context)
+    if not target_id:
+        await update.effective_message.reply_text("⚠️ Usage: Reply to a user or `/rmadmin @username` / `/rmadmin <user_id>`", parse_mode='Markdown')
+        return
+
+    if db_manager:
+        db_manager.remove_bot_admin(target_id)
+        await update.effective_message.reply_text(f"✅ Removed {target_name} (`{target_id}`) from bot admins.", parse_mode='Markdown')
+
+
+async def _send_broadcast_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_to_forward, text_to_send: str | None, should_pin: bool) -> bool:
+    try:
+        if message_to_forward:
+            sent_msg = await context.bot.copy_message(
+                chat_id=chat_id,
+                from_chat_id=message_to_forward.chat_id,
+                message_id=message_to_forward.message_id
+            )
+        else:
+            sent_msg = await context.bot.send_message(chat_id=chat_id, text=text_to_send, parse_mode='Markdown')
+
+        if should_pin and sent_msg:
+            try:
+                await context.bot.pin_chat_message(chat_id=chat_id, message_id=sent_msg.message_id)
+            except Exception as e:
+                logger.warning(f"Could not pin message in {chat_id}: {e}")
+        return True
+    except error.Forbidden:
+        return False
+    except Exception as e:
+        logger.error(f"Failed broadcast to {chat_id}: {e}")
+        return False
+
+
+async def ubroadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    is_owner_or_admin = (user.id == ADMIN_USER_ID) or (db_manager and db_manager.is_bot_admin(user.id))
+    if not is_owner_or_admin:
+        await update.effective_message.reply_text("❌ You are not authorized to broadcast.")
+        return
+
+    should_pin = False
+    args = list(context.args) if context.args else []
+    if args and args[0].lower() == "pin":
+        should_pin = True
+        args.pop(0)
+
+    reply_msg = update.effective_message.reply_to_message
+    text_to_send = " ".join(args) if args else None
+
+    if not reply_msg and not text_to_send:
+        await update.effective_message.reply_text("⚠️ Usage: `/ubroadcast [pin] <text>` or reply to a message with `/ubroadcast [pin]`", parse_mode='Markdown')
+        return
+
+    if not db_manager:
+        await update.effective_message.reply_text("❌ Database error.")
+        return
+
+    dm_chats = db_manager.get_chats_by_type(["PRIVATE", "private"])
+    user_ids = set()
+    for c in dm_chats:
+        user_ids.add(c["chat_id"])
+    for u_id in db_manager.data.get("started_users", []):
+        user_ids.add(u_id)
+
+    status_msg = await update.effective_message.reply_text(f"📢 *Broadcasting to {len(user_ids)} user DMs...*", parse_mode='Markdown')
+
+    success_count = 0
+    fail_count = 0
+
+    for u_id in user_ids:
+        res = await _send_broadcast_message(context, u_id, reply_msg, text_to_send, should_pin)
+        if res:
+            success_count += 1
+        else:
+            fail_count += 1
+
+    pin_str = "\n📌 *Messages Pinned*" if should_pin else ""
+    await status_msg.edit_text(
+        f"✅ **DM Broadcast Complete**\nSuccessful: **{success_count}**\nFailed: **{fail_count}**{pin_str}",
+        parse_mode='Markdown'
+    )
+
+
+async def gbroadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    is_owner_or_admin = (user.id == ADMIN_USER_ID) or (db_manager and db_manager.is_bot_admin(user.id))
+    if not is_owner_or_admin:
+        await update.effective_message.reply_text("❌ You are not authorized to broadcast.")
+        return
+
+    should_pin = False
+    args = list(context.args) if context.args else []
+    if args and args[0].lower() == "pin":
+        should_pin = True
+        args.pop(0)
+
+    reply_msg = update.effective_message.reply_to_message
+    text_to_send = " ".join(args) if args else None
+
+    if not reply_msg and not text_to_send:
+        await update.effective_message.reply_text("⚠️ Usage: `/gbroadcast [pin] <text>` or reply to a message with `/gbroadcast [pin]`", parse_mode='Markdown')
+        return
+
+    if not db_manager:
+        await update.effective_message.reply_text("❌ Database error.")
+        return
+
+    group_chats = db_manager.get_chats_by_type(["GROUP", "SUPERGROUP", "group", "supergroup"])
+    group_ids = [c["chat_id"] for c in group_chats]
+
+    status_msg = await update.effective_message.reply_text(f"📢 *Broadcasting to {len(group_ids)} groups...*", parse_mode='Markdown')
+
+    success_count = 0
+    fail_count = 0
+
+    for g_id in group_ids:
+        res = await _send_broadcast_message(context, g_id, reply_msg, text_to_send, should_pin)
+        if res:
+            success_count += 1
+        else:
+            fail_count += 1
+
+    pin_str = "\n📌 *Messages Pinned*" if should_pin else ""
+    await status_msg.edit_text(
+        f"✅ **Group Broadcast Complete**\nSuccessful: **{success_count}**\nFailed: **{fail_count}**{pin_str}",
+        parse_mode='Markdown'
+    )
+
+
+async def groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    is_owner_or_admin = (user.id == ADMIN_USER_ID) or (db_manager and db_manager.is_bot_admin(user.id))
+    if not is_owner_or_admin:
+        await update.effective_message.reply_text("❌ You are not authorized to view the groups list.")
+        return
+
+    await render_groups_page(update, context, page=0)
+
+
+async def render_groups_page(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0) -> None:
+    if not db_manager:
+        return
+
+    groups = db_manager.get_chats_by_type(["GROUP", "SUPERGROUP", "group", "supergroup"])
+    total_groups = len(groups)
+
+    if total_groups == 0:
+        msg = "👥 **Joined Groups List:**\n\n*The bot is currently not in any recorded groups.*"
+        if update.callback_query:
+            await update.callback_query.edit_message_text(msg, parse_mode='Markdown')
+        else:
+            await update.effective_message.reply_text(msg, parse_mode='Markdown')
+        return
+
+    per_page = 50
+    total_pages = (total_groups + per_page - 1) // per_page
+    page = max(0, min(page, total_pages - 1))
+
+    start_idx = page * per_page
+    end_idx = min(start_idx + per_page, total_groups)
+    page_groups = groups[start_idx:end_idx]
+
+    lines = [f"👥 **Joined Groups List (Page {page + 1}/{total_pages}):**", "-------------------------------------"]
+
+    for i, g in enumerate(page_groups, start=start_idx + 1):
+        title = g.get("title") or f"Group {g['chat_id']}"
+        link = g.get("invite_link")
+        if link:
+            lines.append(f"{i}. [{title}]({link}) (`{g['chat_id']}`)")
+        else:
+            lines.append(f"{i}. **{title}** (`{g['chat_id']}`)")
+
+    msg_text = "\n".join(lines)
+
+    buttons = []
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"groups_page_{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"groups_page_{page + 1}"))
+    if nav_row:
+        buttons.append(nav_row)
+
+    reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(msg_text, reply_markup=reply_markup, parse_mode='Markdown', disable_web_page_preview=True)
+    else:
+        await update.effective_message.reply_text(msg_text, reply_markup=reply_markup, parse_mode='Markdown', disable_web_page_preview=True)
+
+
+async def track_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    result = update.my_chat_member
+    if not result:
+        return
+
+    chat = result.chat
+    if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        return
+
+    was_member = result.old_chat_member.status in ['member', 'administrator']
+    is_member = result.new_chat_member.status in ['member', 'administrator']
+
+    user_who_did = result.from_user
+    user_str = f"@{user_who_did.username}" if user_who_did and user_who_did.username else (user_who_did.first_name if user_who_did else "Unknown")
+
+    chat_photo = None
+    try:
+        chat_full = await context.bot.get_chat(chat.id)
+        chat_photo = chat_full.photo
+    except Exception as e:
+        logger.warning(f"Could not fetch chat photo for {chat.id}: {e}")
+
+    invite_link = ""
+    if is_member and not was_member:
+        try:
+            invite_link = await context.bot.export_chat_invite_link(chat.id)
+        except Exception:
+            invite_link = chat.invite_link or ""
+
+        if db_manager:
+            db_manager.add_chat(chat.id, chat.type.name, chat.title, invite_link, update.effective_message.date.timestamp() if update.effective_message else time.time())
+
+        log_msg = (
+            f"➕ **Bot Added to Group!**\n"
+            f"-------------------------------------\n"
+            f"📛 **Group Name:** {chat.title}\n"
+            f"🆔 **Group ID:** `{chat.id}`\n"
+            f"👤 **Added By:** {user_str} (`{user_who_did.id if user_who_did else 'N/A'}`)\n"
+            f"🔗 **Invite Link:** {invite_link or 'N/A'}"
+        )
+
+    elif was_member and not is_member:
+        if db_manager:
+            db_manager.remove_chat(chat.id)
+
+        log_msg = (
+            f"➖ **Bot Removed from Group!**\n"
+            f"-------------------------------------\n"
+            f"📛 **Group Name:** {chat.title}\n"
+            f"🆔 **Group ID:** `{chat.id}`\n"
+            f"👤 **Removed By:** {user_str} (`{user_who_did.id if user_who_did else 'N/A'}`)"
+        )
+    else:
+        return
+
+    if LOG_CHANNEL_ID:
+        try:
+            if chat_photo:
+                file_id = chat_photo.big_file_id
+                await context.bot.send_photo(chat_id=LOG_CHANNEL_ID, photo=file_id, caption=log_msg, parse_mode='Markdown')
+            else:
+                await send_log_notification(context, log_msg)
+        except Exception as e:
+            logger.error(f"Failed to send group log notification: {e}")
+            await send_log_notification(context, log_msg)
+
+
 def create_application(token: str = BOT_TOKEN) -> Application | None:
-    """Builds and configures the Telegram Application instance."""
     if not token:
         return None
 
@@ -856,23 +1669,42 @@ def create_application(token: str = BOT_TOKEN) -> Application | None:
         .build()
     )
 
-    # Register Handlers
+    # 0. Ban check middleware (group=-1)
+    app.add_handler(MessageHandler(filters.ALL, ban_check_middleware), group=-1)
+
+    # 1. Register Command Handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("new", new_game_command))
     app.add_handler(CommandHandler("end", end_game_command))
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("score", score_command))
     app.add_handler(CommandHandler("leaderboard", leaderboard_command))
     app.add_handler(CommandHandler("difficulty", difficulty_command))
-    app.add_handler(CommandHandler("status", status_command))
-    
-    if ADMIN_USER_ID != 0 and db_manager is not None:
-        app.add_handler(CommandHandler("broadcast", broadcast_command))
-    
-    app.add_handler(CommandHandler("help", start_command))
+    app.add_handler(CommandHandler("seekoauth", seekoauth_command))
+    app.add_handler(CommandHandler("rmseekoauth", rmseekoauth_command))
+    app.add_handler(CommandHandler("help", help_command))
 
-    # Callback query handler for inline buttons
+    # Admin commands
+    app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("addscore", addscore_command))
+    app.add_handler(CommandHandler("rmscore", rmscore_command))
+    app.add_handler(CommandHandler("addadmin", addadmin_command))
+    app.add_handler(CommandHandler("rmadmin", rmadmin_command))
+    app.add_handler(CommandHandler("ban", ban_command))
+    app.add_handler(CommandHandler("unban", unban_command))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("ubroadcast", ubroadcast_command))
+    app.add_handler(CommandHandler("gbroadcast", gbroadcast_command))
+    app.add_handler(CommandHandler("groups", groups_command))
+
+    # 2. Group Member Updates (bot join/leave)
+    app.add_handler(ChatMemberHandler(track_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+
+    # 3. Callback query handler for inline buttons
     app.add_handler(CallbackQueryHandler(callback_handler))
-    
-    # Message handler for guesses:
+
+    # 4. Message handler for guesses
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND & filters.Regex(r'^[a-zA-Z]{1,8}$'), 
