@@ -38,6 +38,16 @@ DIFFICULTY_CONFIG = {
     'extreme': {'length': 8, 'max_guesses': 30, 'base_points': 50, 'example': 'FOOTBALL'} 
 }
 
+START_MESSAGE = (
+    "Welcome to WordSeek!\n\n"
+    "A fun and competitive Wordle-style game that you can play directly on Telegram.\n\n"
+    "> Quick Start:\n"
+    "> • Use /new to start a new game\n"
+    "> • Add me to a group with admin permissions to play with friends\n"
+    "> • Use /help for detailed instructions and command list\n\n"
+    "Ready to test your word skills? Let's play!"
+)
+
 # --- Log Channel Configuration ---
 LOG_CHANNEL_ID_ENV = os.getenv("LOG_CHANNEL_ID", "-1003978131834")
 try:
@@ -155,14 +165,15 @@ class JSONDatabaseManager:
             user_data[f"points_{period}"] = 0
             user_data[f"wins_{period}"] = 0
 
-    def update_leaderboard(self, user_id: int, username: str, points_to_add: int):
+    def update_leaderboard(self, user_id: int, username: str, points_to_add: int, full_name: str = ""):
         with self.lock:
             now = datetime.now(timezone.utc)
             user_key = str(user_id)
             if user_key not in self.data["leaderboard"]:
                 self.data["leaderboard"][user_key] = {
                     "user_id": user_id,
-                    "username": username or "Unknown",
+                    "username": username or "",
+                    "full_name": full_name or username or "Player",
                     "points_global": 0,
                     "wins_global": 0,
                     "points_daily": 0,
@@ -176,6 +187,8 @@ class JSONDatabaseManager:
             user_data = self.data["leaderboard"][user_key]
             if username:
                 user_data["username"] = username
+            if full_name:
+                user_data["full_name"] = full_name
             user_data["points_global"] = user_data.get("points_global", 0) + points_to_add
             user_data["wins_global"] = user_data.get("wins_global", 0) + 1
 
@@ -187,7 +200,7 @@ class JSONDatabaseManager:
 
             self._save_unlocked()
 
-    def get_leaderboard_data(self, period: str, limit=10) -> List[Tuple[str, int, int]]:
+    def get_leaderboard_data(self, period: str, limit=10) -> List[Tuple[int, str, int, int]]:
         with self.lock:
             now = datetime.now(timezone.utc)
             points_key = f"points_{period}"
@@ -202,9 +215,11 @@ class JSONDatabaseManager:
                 wins = user_data.get(wins_key, 0)
 
                 if points > 0 or period == "global":
-                    result.append((user_data.get("username", "Unknown"), points, wins))
+                    user_id = user_data.get("user_id", 0)
+                    name = user_data.get("full_name") or user_data.get("username") or "Player"
+                    result.append((user_id, name, points, wins))
 
-            result.sort(key=lambda x: x[1], reverse=True)
+            result.sort(key=lambda x: x[2], reverse=True)
             return result[:limit]
 
     def get_game_state(self, chat_id: int) -> Dict | None:
@@ -431,7 +446,7 @@ def get_feedback(secret_word: str, guess: str) -> str:
                 feedback[i] = '🟨'
                 remaining_letters[letter] -= 1
     
-    return "".join(feedback)
+    return " ".join(feedback)
 
 def calculate_points(difficulty: str, guesses: int) -> int:
     """Calculates points based on difficulty and efficiency."""
@@ -498,7 +513,7 @@ async def process_guess_logic(chat_id: int, guess: str) -> Tuple[str, bool, str,
     
     # 2. Check if word is valid (exists in word.txt)
     if VALID_WORDS_SET and guess_clean not in VALID_WORDS_SET:
-        return "", False, f"❌ **`{guess.upper()}`** is a **wrong word**! It is not in word.txt.", 0, game.get('guess_history', [])
+        return "", False, f"❌ **`{guess.upper()}`** is not a valid word.", 0, game.get('guess_history', [])
 
     # 3. Check if word has already been guessed
     if guess_clean in game.get('guessed_words', []):
@@ -560,13 +575,14 @@ def get_start_keyboard(bot_username: str = "narzowordseekbot"):
     ]
     return InlineKeyboardMarkup(keyboard)
 
-def get_help_menu_keyboard():
+def get_help_menu_keyboard(show_back_to_start: bool = True):
     keyboard = [
         [InlineKeyboardButton("📝 How to Play", callback_data="show_how_to_play")],
         [InlineKeyboardButton("📘 Commands List", callback_data="show_commands")],
-        [InlineKeyboardButton("🏆 Leaderboard", callback_data="show_leaderboard_menu")],
-        [InlineKeyboardButton("🏠 Back to Start", callback_data="back_to_start")]
+        [InlineKeyboardButton("🏆 Leaderboard", callback_data="show_leaderboard_menu")]
     ]
+    if show_back_to_start:
+        keyboard.append([InlineKeyboardButton("🏠 Back to Start", callback_data="back_to_start")])
     return InlineKeyboardMarkup(keyboard)
 
 def get_play_again_keyboard():
@@ -705,10 +721,14 @@ async def display_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         message = f"🏆 **{title} Leaderboard** (Top 10)\n"
         message += "-------------------------------------\n"
-        for i, (username, points, wins) in enumerate(data):
+        for i, (user_id, name, points, wins) in enumerate(data):
             rank_style = "🥇" if i == 0 else "🥈" if i == 1 else "🥉" if i == 2 else f"**{i+1}.**"
-            name = f"@{username}" if username else f"User ID `{data[i][0]}`"
-            message += f"{rank_style} {name} - **`{points}`** pts ({wins} wins)\n"
+            safe_name = name.replace("[", "").replace("]", "")
+            if user_id:
+                name_link = f"[{safe_name}](tg://user?id={user_id})"
+            else:
+                name_link = safe_name
+            message += f"{rank_style} {name_link} - **`{points}`** pts ({wins} wins)\n"
             
     # Send as a new message if it's a command, or edit if it's a callback
     if update.callback_query:
@@ -739,15 +759,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             log_msg = f"🚀 **Bot Started**\n👤 **User:** {user_info}\n💬 **Chat:** {chat_title} (`{chat.id}`)"
             await send_log_notification(context, log_msg)
 
-    start_caption = (
-        "Welcome to WordSeek!\n\n"
-        "A fun and competitive Wordle-style game that you can play directly on Telegram.\n\n"
-        "> Quick Start:\n"
-        "> • Use /new to start a new game\n"
-        "> • Add me to a group with admin permissions to play with friends\n"
-        "> • Use /help for detailed instructions and command list\n\n"
-        "Ready to test your word skills? Let's play!"
-    )
+    start_caption = START_MESSAGE
 
     bot_username = context.bot.username or "narzowordseekbot"
     reply_markup = get_start_keyboard(bot_username)
@@ -776,7 +788,27 @@ async def new_game_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if db_manager and update.effective_message:
         db_manager.add_chat(chat_id, update.effective_chat.type.name, update.effective_message.date.timestamp())
 
-    difficulty = context.args[0].lower() if context.args else 'medium'
+    cmd = update.effective_message.text.split()[0].lower() if update.effective_message and update.effective_message.text else ""
+    if "new4" in cmd:
+        difficulty = "easy"
+    elif "new5" in cmd:
+        difficulty = "medium"
+    elif "new8" in cmd:
+        difficulty = "hard"
+    elif context.args:
+        arg = context.args[0].lower()
+        if arg in ["4", "easy"]:
+            difficulty = "easy"
+        elif arg in ["5", "medium"]:
+            difficulty = "medium"
+        elif arg in ["8", "hard"]:
+            difficulty = "hard"
+        elif arg in ["extreme"]:
+            difficulty = "extreme"
+        else:
+            difficulty = arg
+    else:
+        difficulty = "medium"
     
     if db_manager and db_manager.get_game_state(chat_id):
         await update.message.reply_text("⏳ *A game is already active*. Use **/end** to stop it first.")
@@ -935,15 +967,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     chat_id = query.message.chat_id
     
     if query.data == "back_to_start":
+        bot_username = context.bot.username or "narzowordseekbot"
         await safe_edit_message(query,
-            "👋 *Hello! I'm* **WordRush Bot** 🤖\n"
-            "-------------------------------------\n"
-            "The **Ultimate Word Challenge** on Telegram!\n\n"
-            "📜 **Goal:** *Guess the secret word using hints (🟩/🟨/🟥).*\n"
-            "🏆 **Compete:** *Win to earn points and climb the Global Leaderboard!* 🌐\n\n"
-            "👉 Tap **/new** or the button below to start your rush!\n"
-            "-------------------------------------",
-            reply_markup=get_start_keyboard(),
+            START_MESSAGE,
+            reply_markup=get_start_keyboard(bot_username),
             parse_mode='Markdown'
         )
     
@@ -971,15 +998,33 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await safe_edit_message(query, commands_list, reply_markup=get_help_menu_keyboard(), parse_mode='Markdown')
 
     elif query.data == "show_commands":
+        user = update.effective_user
+        is_admin = (user and user.id == ADMIN_USER_ID) or (db_manager and user and db_manager.is_bot_admin(user.id))
         commands_list = (
             "📘 **Word Rush Commands List**\n"
             "-------------------------------------\n"
-            "• **/new** [difficulty] → *Start a game*.\n"
-            "• **/status** → *Show current game status and history* (New Feature!).\n"
-            "• **/leaderboard** [period] → *Show global/daily/weekly/monthly rankings*.\n"
-            "• **/end** → *End current game* (Admin Only / DM).\n"
-            "• **/difficulty** → *Show difficulty settings* (Admin Only / DM).\n"
+            "• **/start** → *Start the bot & show welcome message*\n"
+            "• **/new** [difficulty] → *Start a new game* (e.g. `/new`, `/new4`, `/new5`, `/new8`).\n"
+            "• **/end** → *End current game* (Admin/Granted user).\n"
+            "• **/status** → *Show current game status and history*.\n"
+            "• **/score** [user/reply] → *Check game score & wins*.\n"
+            "• **/leaderboard** [period] → *Show rankings*.\n"
+            "• **/difficulty** → *Show difficulty settings*.\n"
+            "• **/seekoauth** [user/reply] → *Grant game end power*.\n"
+            "• **/rmseekoauth** [user/reply] → *Remove game end power*.\n"
+            "• **/help** → *Open Help Center menu*.\n"
         )
+        if is_admin:
+            commands_list += (
+                "\n👑 **Admin Commands:**\n"
+                "• **/admin** → *Open admin panel*\n"
+                "• **/stats** → *View bot statistics*\n"
+                "• **/addscore** / **/rmscore** → *Manage user scores*\n"
+                "• **/addadmin** / **/rmadmin** → *Manage bot admins*\n"
+                "• **/ban** / **/unban** → *Ban/unban users*\n"
+                "• **/broadcast** / **/ubroadcast** / **/gbroadcast** → *Broadcast messages*\n"
+                "• **/groups** → *List joined groups*\n"
+            )
         await safe_edit_message(query, commands_list, reply_markup=get_help_menu_keyboard(), parse_mode='Markdown')
         
     elif query.data == "show_leaderboard_menu":
@@ -1058,20 +1103,25 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if is_win:
         word_was = guess_history[-1].split(' - ')[-1].replace('**', '').strip() 
         
+        # React to user's winning guess message with a random emoji
+        winning_reactions = ["⚡", "❤️", "💯", "🎉", "🥳"]
+        chosen_reaction = random.choice(winning_reactions)
+        try:
+            await update.message.set_reaction(chosen_reaction)
+        except Exception as e:
+            logger.warning(f"Could not set reaction on winning message: {e}")
+
         # This function now updates global, daily, weekly, and monthly scores
-        db_manager.update_leaderboard(user.id, username, points)
+        db_manager.update_leaderboard(user.id, user.username or '', points, full_name=user.full_name or user.first_name)
         log_msg = f"🏆 **Game Won!**\n👤 **Winner:** @{username} (`{user.id}`)\n💬 **Chat ID:** `{chat_id}`\n🔑 **Word:** `{word_was}`\n🎯 **Points:** `{points}` ({len(guess_history)} attempts)"
         await send_log_notification(context, log_msg)
         
+        word_length = len(game_state.get('word', ''))
         reply_text = (
-            f"**🏆 GAME WON! 🥳**\n"
-            f"-------------------------------------\n"
-            f"*Congratulations* **{username}**!\n"
-            f"You cracked the code in **{len(guess_history)}** attempts!\n"
-            f"✨ Points earned: **`{points}`**\n\n"
-            f"📜 **Final Board:**\n"
-            f"{game_history_display}\n\n" 
-            f"✅ *The secret word was:* **`{word_was}`**"
+            f"> Congrats! You guessed it correctly.\n"
+            f"> Correct Word: {word_was.lower()}\n"
+            f"> Added {points} to the leaderboard.\n"
+            f"> Start with /new{word_length}"
         )
         reply_markup = get_play_again_keyboard()
 
@@ -1133,34 +1183,17 @@ def to_small_caps(text: str) -> str:
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    raw_help_text = (
-        "WordSeek Commands List:\n\n"
-        "• /start - Start the bot & show welcome message\n"
-        "• /new [difficulty] - Start a new WordSeek challenge\n"
-        "• /end - End current active game (Admins/Granted user)\n"
-        "• /status - View ongoing game status & history\n"
-        "• /score [user/reply] - Check game score & wins\n"
-        "• /leaderboard [period] - View leaderboards\n"
-        "• /difficulty - View difficulty settings\n"
-        "• /seekoauth - Grant game end power to a member (Admin)\n"
-        "• /rmseekoauth - Remove game end power from a member (Admin)\n"
-        "• /help - Display this commands list\n\n"
-        "Admin Commands:\n"
-        "• /admin - Open admin panel\n"
-        "• /stats - View total users, groups & uptime\n"
-        "• /addscore <pts> [user/reply] - Add score to user\n"
-        "• /rmscore <pts> [user/reply] - Remove score from user\n"
-        "• /addadmin [user/reply] - Promote bot admin\n"
-        "• /rmadmin [user/reply] - Demote bot admin\n"
-        "• /ban [user/reply] - Ban user from bot\n"
-        "• /unban [user/reply] - Unban user from bot\n"
-        "• /broadcast <text/reply> - Broadcast message to all\n"
-        "• /ubroadcast [pin] <text/reply> - Broadcast to user DMs\n"
-        "• /gbroadcast [pin] <text/reply> - Broadcast to groups\n"
-        "• /groups - List joined groups with direct join links"
+    help_text = (
+        "📖 **WordRush Help Center**\n"
+        "-------------------------------------\n"
+        "*Choose a topic below to get assistance.*\n"
+        "*For any issue, please ask in the Report group!*"
     )
-    small_caps_help = to_small_caps(raw_help_text)
-    await update.effective_message.reply_text(small_caps_help)
+    await update.effective_message.reply_text(
+        help_text,
+        reply_markup=get_help_menu_keyboard(show_back_to_start=False),
+        parse_mode="Markdown"
+    )
 
 
 async def extract_target_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[int | None, str | None]:
@@ -1669,11 +1702,17 @@ async def track_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYP
     user_str = f"@{user_who_did.username}" if user_who_did and user_who_did.username else (user_who_did.first_name if user_who_did else "Unknown")
 
     chat_photo = None
+    member_count = "N/A"
     try:
         chat_full = await context.bot.get_chat(chat.id)
         chat_photo = chat_full.photo
     except Exception as e:
         logger.warning(f"Could not fetch chat photo for {chat.id}: {e}")
+
+    try:
+        member_count = await context.bot.get_chat_member_count(chat.id)
+    except Exception as e:
+        logger.warning(f"Could not fetch member count for {chat.id}: {e}")
 
     invite_link = ""
     if is_member and not was_member:
@@ -1690,6 +1729,7 @@ async def track_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYP
             f"-------------------------------------\n"
             f"📛 **Group Name:** {chat.title}\n"
             f"🆔 **Group ID:** `{chat.id}`\n"
+            f"👥 **Members:** `{member_count}`\n"
             f"👤 **Added By:** {user_str} (`{user_who_did.id if user_who_did else 'N/A'}`)\n"
             f"🔗 **Invite Link:** {invite_link or 'N/A'}"
         )
@@ -1703,6 +1743,7 @@ async def track_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYP
             f"-------------------------------------\n"
             f"📛 **Group Name:** {chat.title}\n"
             f"🆔 **Group ID:** `{chat.id}`\n"
+            f"👥 **Members:** `{member_count}`\n"
             f"👤 **Removed By:** {user_str} (`{user_who_did.id if user_who_did else 'N/A'}`)"
         )
     else:
@@ -1752,7 +1793,7 @@ def create_application(token: str = BOT_TOKEN) -> Application | None:
 
     # 1. Register Command Handlers
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("new", new_game_command))
+    app.add_handler(CommandHandler(["new", "new4", "new5", "new8"], new_game_command))
     app.add_handler(CommandHandler("end", end_game_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("score", score_command))

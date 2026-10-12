@@ -59,10 +59,10 @@ class TestJSONDatabaseManager(unittest.TestCase):
         data = self.db.get_leaderboard_data("global")
         self.assertEqual(len(data), 2)
         # Alice has 30 points, Bob has 25 points. Alice should be first.
-        self.assertEqual(data[0][0], "Alice")
-        self.assertEqual(data[0][1], 30)
-        self.assertEqual(data[1][0], "Bob")
-        self.assertEqual(data[1][1], 25)
+        self.assertEqual(data[0][1], "Alice")
+        self.assertEqual(data[0][2], 30)
+        self.assertEqual(data[1][1], "Bob")
+        self.assertEqual(data[1][2], 25)
 
     def test_leaderboard_period_reset(self):
         user_id = 100
@@ -93,8 +93,8 @@ class TestJSONDatabaseManager(unittest.TestCase):
 
         data_daily_after = self.db.get_leaderboard_data("daily")
         self.assertEqual(len(data_daily_after), 1)
-        self.assertEqual(data_daily_after[0][1], 15)  # 0 reset + 15
-        self.assertEqual(data_daily_after[0][2], 1)   # 0 reset + 1 win
+        self.assertEqual(data_daily_after[0][2], 15)  # 0 reset + 15
+        self.assertEqual(data_daily_after[0][3], 1)   # 0 reset + 1 win
 
 class TestApplicationConfiguration(unittest.TestCase):
     def test_create_application_custom_timeouts(self):
