@@ -3,7 +3,7 @@ import os
 import json
 import time
 from datetime import datetime, timedelta, timezone
-from main import JSONDatabaseManager
+from main import JSONDatabaseManager, create_application
 
 class TestJSONDatabaseManager(unittest.TestCase):
     def setUp(self):
@@ -95,6 +95,24 @@ class TestJSONDatabaseManager(unittest.TestCase):
         self.assertEqual(len(data_daily_after), 1)
         self.assertEqual(data_daily_after[0][1], 15)  # 0 reset + 15
         self.assertEqual(data_daily_after[0][2], 1)   # 0 reset + 1 win
+
+class TestApplicationConfiguration(unittest.TestCase):
+    def test_create_application_custom_timeouts(self):
+        token = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
+        app = create_application(token)
+        self.assertIsNotNone(app)
+
+        # Check HTTPXRequest timeouts on bot
+        request = app.bot.request
+        timeout = request._client_kwargs.get("timeout")
+        self.assertIsNotNone(timeout)
+        self.assertEqual(timeout.connect, 30.0)
+        self.assertEqual(timeout.read, 30.0)
+        self.assertEqual(timeout.write, 30.0)
+
+    def test_create_application_none_token(self):
+        app = create_application(None)
+        self.assertIsNone(app)
 
 if __name__ == "__main__":
     unittest.main()
