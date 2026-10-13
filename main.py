@@ -4,6 +4,7 @@ import os
 import random
 import re
 import logging
+import html
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, error
@@ -458,7 +459,7 @@ def calculate_points(difficulty: str, guesses: int) -> int:
     return base + bonus
 
 async def start_new_game_logic(chat_id: int, difficulty: str) -> Tuple[bool, str]:
-    if not db_manager: return False, "❌ *Database Error*. Game cannot be started without database access."
+    if not db_manager: return False, "❌ <b>Database Error</b>. Game cannot be started without database access."
     
     difficulty = difficulty.lower()
     if difficulty not in DIFFICULTY_CONFIG:
@@ -469,7 +470,7 @@ async def start_new_game_logic(chat_id: int, difficulty: str) -> Tuple[bool, str
     word_list = WORDS_BY_LENGTH.get(length)
     
     if not word_list:
-        return False, f"❌ *Error*: No secret words found for **{difficulty}** ({length} letters). Contact admin."
+        return False, f"❌ <b>Error</b>: No secret words found for <b>{html.escape(difficulty)}</b> ({length} letters). Contact admin."
     
     # Select a secret word from the list
     secret_word = random.choice(word_list)
@@ -486,11 +487,11 @@ async def start_new_game_logic(chat_id: int, difficulty: str) -> Tuple[bool, str
     
     return True, (
         f"<blockquote>"
-        f"**✨ New Word Rush Challenge!**\n\n"
+        f"<b>✨ New Word Rush Challenge!</b>\n\n"
         f"-------------------------------------\n"
-        f"🎯 Difficulty: **{difficulty.capitalize()}**\n"
-        f"📜 Word Length: **{length} letters** (Example: `{config['example']}`)\n"
-        f"➡️ *Send your {length}-letter guess directly to the chat!*"
+        f"🎯 Difficulty: <b>{html.escape(difficulty.capitalize())}</b>\n"
+        f"📜 Word Length: <b>{length} letters</b> (Example: <code>{html.escape(config['example'])}</code>)\n"
+        f"➡️ <i>Send your {length}-letter guess directly to the chat!</i>"
         f"</blockquote>"
     )
 
@@ -512,16 +513,16 @@ async def process_guess_logic(chat_id: int, guess: str) -> Tuple[str, bool, str,
     # 1. Validation for length (Should match game length)
     if len(guess_clean) != length:
         # User message for incorrect length
-        return "", False, f"❌ **`{guess.upper()}`** *must be exactly* **{length}** *letters long*.", 0, game.get('guess_history', [])
+        return "", False, f"❌ <b><code>{html.escape(guess.upper())}</code></b> <i>must be exactly</i> <b>{length}</b> <i>letters long</i>.", 0, game.get('guess_history', [])
     
     # 2. Check if word is valid (exists in word.txt)
     if VALID_WORDS_SET and guess_clean not in VALID_WORDS_SET:
-        return "", False, f"❌ **`{guess.upper()}`** is not a valid word.", 0, game.get('guess_history', [])
+        return "", False, f"❌ <b><code>{html.escape(guess.upper())}</code></b> is not a valid word.", 0, game.get('guess_history', [])
 
     # 3. Check if word has already been guessed
     if guess_clean in game.get('guessed_words', []):
         # User message for duplicate guess
-        return "", False, f"❌ **`{guess.upper()}`** *already guessed! Try a new word*.", 0, game.get('guess_history', [])
+        return "", False, f"❌ <b><code>{html.escape(guess.upper())}</code></b> <i>already guessed! Try a new word</i>.", 0, game.get('guess_history', [])
 
     
     game['guesses_made'] += 1
@@ -530,7 +531,7 @@ async def process_guess_logic(chat_id: int, guess: str) -> Tuple[str, bool, str,
     # 3. Generate Feedback and update history
     feedback_str = get_feedback(secret_word, guess_clean)
     # Storing in the required format: Blocks - WORD
-    game['guess_history'].append(f" `{feedback_str}` - **{guess_clean}**") 
+    game['guess_history'].append(f" <code>{feedback_str}</code> - <b>{html.escape(guess_clean)}</b>")
     
     # 4. Check for Win
     if guess_clean == secret_word:
@@ -551,7 +552,7 @@ async def process_guess_logic(chat_id: int, guess: str) -> Tuple[str, bool, str,
     
     # Status for ongoing game
     db_manager.save_game_state(chat_id, game)
-    return feedback_str, False, f"Guesses left: **{remaining}**", 0, game['guess_history']
+    return feedback_str, False, f"Guesses left: <b>{remaining}</b>", 0, game['guess_history']
 
 # --- Telegram UI & Handler Functions (All Unchanged) ---
 
@@ -629,7 +630,7 @@ async def safe_edit_message(
     target,
     text: str,
     reply_markup=None,
-    parse_mode: str = 'Markdown',
+    parse_mode: str = 'HTML',
     disable_web_page_preview=None
 ) -> None:
     """
@@ -1098,7 +1099,7 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     
     # 1. Handle validation errors (Incorrect length OR Duplicate guess)
     if status_message.startswith("❌"):
-        await update.message.reply_text(status_message, parse_mode='Markdown')
+        await update.message.reply_text(status_message, parse_mode='HTML')
         return
 
     reply_markup = None
@@ -1109,7 +1110,7 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # 3. Handle Win/Loss/Ongoing
     
     if is_win:
-        word_was = guess_history[-1].split(' - ')[-1].replace('**', '').strip() 
+        word_was = game_state.get('word', guess.upper())
         
         # React to user's winning guess message with a random emoji
         winning_reactions = ["⚡", "❤️", "💯", "🎉", "🥳"]
@@ -1125,14 +1126,14 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await send_log_notification(context, log_msg)
         
         word_length = len(game_state.get('word', ''))
-        user_mention = f"@{user.username}" if user and user.username else (user.full_name or user.first_name)
+        user_mention = f"@{html.escape(user.username)}" if user and user.username else html.escape(user.full_name or user.first_name)
         attempts = len(guess_history)
         reply_text = (
             f"<blockquote>"
-            f"🏆 **Congrats! You guessed it correctly.**\n\n"
-            f"👤 **Winner:** {user_mention}\n"
-            f"🔑 **Correct Word:** `{word_was.lower()}`\n"
-            f"🎯 **Score:** +{points} points (in {attempts} attempts)\n\n"
+            f"🏆 <b>Congrats! You guessed it correctly.</b>\n\n"
+            f"👤 <b>Winner:</b> {user_mention}\n"
+            f"🔑 <b>Correct Word:</b> <code>{html.escape(word_was.lower())}</code>\n"
+            f"🎯 <b>Score:</b> +{points} points (in {attempts} attempts)\n\n"
             f"➡️ Start with /new{word_length}"
             f"</blockquote>"
         )
@@ -1145,12 +1146,12 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         
         reply_text = (
             f"<blockquote>"
-            f"💔 **GAME OVER! 😭**\n\n"
+            f"💔 <b>GAME OVER! 😭</b>\n\n"
             f"-------------------------------------\n"
-            f"*Maximum guesses reached* (**{game_state['max_guesses']}**).\n\n"
-            f"📜 **Final Board:**\n"
+            f"<i>Maximum guesses reached</i> (<b>{game_state['max_guesses']}</b>).\n\n"
+            f"📜 <b>Final Board:</b>\n"
             f"{game_history_display}\n\n"
-            f"❌ *The secret word was:* **`{word_was}`**"
+            f"❌ <i>The secret word was:</i> <b><code>{html.escape(word_was)}</code></b>"
             f"</blockquote>"
         )
         reply_markup = get_play_again_keyboard()
@@ -1159,10 +1160,10 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # Ongoing game message (Show full history + status)
         reply_text = (
             f"<blockquote>"
-            f"**Word Rush Challenge** 🎯\n\n"
+            f"<b>Word Rush Challenge</b> 🎯\n\n"
             f"-------------------------------------\n"
-            f"Attempts: **`{len(guess_history)}`** / **`{game_state['max_guesses']}`**\n\n"
-            f"📜 **Guess History:**\n"
+            f"Attempts: <b><code>{len(guess_history)}</code></b> / <b><code>{game_state['max_guesses']}</code></b>\n\n"
+            f"📜 <b>Guess History:</b>\n"
             f"{game_history_display}\n\n"
             f"👉 {status_message}"
             f"</blockquote>"
@@ -1171,7 +1172,7 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(
         reply_text, 
         reply_markup=reply_markup, 
-        parse_mode='Markdown'
+        parse_mode='HTML'
     )
 
 # --- Main Bot Runner ---

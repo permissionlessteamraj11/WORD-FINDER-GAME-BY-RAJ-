@@ -125,7 +125,7 @@ class TestSafeEditMessage(unittest.IsolatedAsyncioTestCase):
         query.edit_message_text = AsyncMock()
 
         await safe_edit_message(query, "Hello World")
-        query.edit_message_text.assert_called_once_with(text="Hello World", parse_mode="Markdown")
+        query.edit_message_text.assert_called_once_with(text="Hello World", parse_mode="HTML")
 
     async def test_photo_message_edit_caption(self):
         from unittest.mock import AsyncMock, MagicMock
@@ -136,7 +136,7 @@ class TestSafeEditMessage(unittest.IsolatedAsyncioTestCase):
         query.edit_message_caption = AsyncMock()
 
         await safe_edit_message(query, "New Caption")
-        query.edit_message_caption.assert_called_once_with(caption="New Caption", parse_mode="Markdown")
+        query.edit_message_caption.assert_called_once_with(caption="New Caption", parse_mode="HTML")
 
     async def test_bad_request_no_text_fallback_to_caption(self):
         from unittest.mock import AsyncMock, MagicMock
@@ -148,7 +148,7 @@ class TestSafeEditMessage(unittest.IsolatedAsyncioTestCase):
         query.edit_message_caption = AsyncMock()
 
         await safe_edit_message(query, "Fallback Text")
-        query.edit_message_caption.assert_called_once_with(caption="Fallback Text", parse_mode="Markdown")
+        query.edit_message_caption.assert_called_once_with(caption="Fallback Text", parse_mode="HTML")
 
     async def test_message_not_modified_ignored(self):
         from unittest.mock import AsyncMock, MagicMock
@@ -171,7 +171,7 @@ class TestSafeEditMessage(unittest.IsolatedAsyncioTestCase):
         query.edit_message_caption = AsyncMock(side_effect=error.BadRequest("Unknown error"))
 
         await safe_edit_message(query, "Fallback Reply")
-        query.message.reply_text.assert_called_once_with(text="Fallback Reply", parse_mode="Markdown")
+        query.message.reply_text.assert_called_once_with(text="Fallback Reply", parse_mode="HTML")
 
 if __name__ == "__main__":
     unittest.main()
