@@ -7,7 +7,7 @@ import logging
 import html
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, error
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, error
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, ApplicationHandlerStop, ChatMemberHandler
 from telegram.request import HTTPXRequest
 from telegram.constants import ChatType
@@ -96,7 +96,7 @@ class JSONDatabaseManager:
             "started_users": [],
             "banned_users": [],
             "bot_admins": [],
-            "seek_oauth": {}
+            "seek_auth": {}
         }
         self._load()
 
@@ -113,7 +113,7 @@ class JSONDatabaseManager:
                             self.data["started_users"] = loaded_data.get("started_users", [])
                             self.data["banned_users"] = loaded_data.get("banned_users", [])
                             self.data["bot_admins"] = loaded_data.get("bot_admins", [])
-                            self.data["seek_oauth"] = loaded_data.get("seek_oauth", {})
+                            self.data["seek_auth"] = loaded_data.get("seek_auth", loaded_data.get("seek_oauth", {}))
                     logger.info(f"✅ JSON Database loaded successfully from {self.db_path}.")
                 except Exception as e:
                     logger.error(f"❌ Failed to load JSON Database from {self.db_path}: {e}")
@@ -317,30 +317,39 @@ class JSONDatabaseManager:
                 self.data["bot_admins"].remove(user_id)
                 self._save_unlocked()
 
-    def has_seek_oauth(self, chat_id: int, user_id: int) -> bool:
+    def has_seek_auth(self, chat_id: int, user_id: int) -> bool:
         with self.lock:
             chat_key = str(chat_id)
-            users = self.data.get("seek_oauth", {}).get(chat_key, [])
+            users = self.data.get("seek_auth", {}).get(chat_key, [])
             return user_id in users
 
-    def grant_seek_oauth(self, chat_id: int, user_id: int):
+    def grant_seek_auth(self, chat_id: int, user_id: int):
         with self.lock:
-            if "seek_oauth" not in self.data:
-                self.data["seek_oauth"] = {}
+            if "seek_auth" not in self.data:
+                self.data["seek_auth"] = {}
             chat_key = str(chat_id)
-            if chat_key not in self.data["seek_oauth"]:
-                self.data["seek_oauth"][chat_key] = []
-            if user_id not in self.data["seek_oauth"][chat_key]:
-                self.data["seek_oauth"][chat_key].append(user_id)
+            if chat_key not in self.data["seek_auth"]:
+                self.data["seek_auth"][chat_key] = []
+            if user_id not in self.data["seek_auth"][chat_key]:
+                self.data["seek_auth"][chat_key].append(user_id)
                 self._save_unlocked()
 
-    def revoke_seek_oauth(self, chat_id: int, user_id: int):
+    def revoke_seek_auth(self, chat_id: int, user_id: int):
         with self.lock:
             chat_key = str(chat_id)
-            if "seek_oauth" in self.data and chat_key in self.data["seek_oauth"]:
-                if user_id in self.data["seek_oauth"][chat_key]:
-                    self.data["seek_oauth"][chat_key].remove(user_id)
+            if "seek_auth" in self.data and chat_key in self.data["seek_auth"]:
+                if user_id in self.data["seek_auth"][chat_key]:
+                    self.data["seek_auth"][chat_key].remove(user_id)
                     self._save_unlocked()
+
+    def has_seek_oauth(self, chat_id: int, user_id: int) -> bool:
+        return self.has_seek_auth(chat_id, user_id)
+
+    def grant_seek_oauth(self, chat_id: int, user_id: int):
+        self.grant_seek_auth(chat_id, user_id)
+
+    def revoke_seek_oauth(self, chat_id: int, user_id: int):
+        self.revoke_seek_auth(chat_id, user_id)
 
     def add_score(self, user_id: int, username: str, points: int):
         with self.lock:
@@ -835,11 +844,11 @@ async def end_game_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     is_admin = await is_group_admin(update, context)
-    has_oauth = db_manager.has_seek_oauth(chat_id, user.id) if db_manager else False
+    has_auth = db_manager.has_seek_auth(chat_id, user.id) if db_manager else False
     is_owner_or_botadmin = (user.id == ADMIN_USER_ID) or (db_manager and db_manager.is_bot_admin(user.id))
 
-    if not (is_admin or has_oauth or is_owner_or_botadmin):
-        await update.effective_message.reply_text("🚨 You don't have permission to end the game. Group admins or authorized members (/seekoauth) can end it.", parse_mode='Markdown')
+    if not (is_admin or has_auth or is_owner_or_botadmin):
+        await update.effective_message.reply_text("🚨 You don't have permission to end the game. Group admins or authorized members (/seekauth) can end it.", parse_mode='Markdown')
         return
 
     game_state = db_manager.get_game_state(chat_id)
@@ -1213,7 +1222,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-async def extract_target_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[int | None, str | None]:
+async def extract_target_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE, fallback_to_sender: bool = False) -> Tuple[int | None, str | None]:
     msg = update.effective_message
     if not msg:
         return None, None
@@ -1222,6 +1231,13 @@ async def extract_target_user_info(update: Update, context: ContextTypes.DEFAULT
         u = msg.reply_to_message.from_user
         name = f"@{u.username}" if u.username else u.first_name
         return u.id, name
+
+    if msg.entities:
+        for entity in msg.entities:
+            if entity.type == MessageEntity.TEXT_MENTION and entity.user:
+                u = entity.user
+                name = f"@{u.username}" if u.username else u.first_name
+                return u.id, name
 
     if context.args:
         arg = context.args[0].strip()
@@ -1239,15 +1255,16 @@ async def extract_target_user_info(update: Update, context: ContextTypes.DEFAULT
                     return u_id, f"@{u_data.get('username')}" if u_data.get('username') else str(u_id)
             return u_id, str(u_id)
 
-    u = update.effective_user
-    if u:
-        name = f"@{u.username}" if u.username else u.first_name
-        return u.id, name
+    if fallback_to_sender:
+        u = update.effective_user
+        if u:
+            name = f"@{u.username}" if u.username else u.first_name
+            return u.id, name
 
     return None, None
 
 
-async def seekoauth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def seekauth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type == ChatType.PRIVATE:
         await update.effective_message.reply_text("❌ This command can only be used in groups.")
         return
@@ -1258,15 +1275,15 @@ async def seekoauth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     target_id, target_name = await extract_target_user_info(update, context)
     if not target_id:
-        await update.effective_message.reply_text("⚠️ Usage: Reply to a user's message or use `/seekoauth @username` / `/seekoauth <user_id>`", parse_mode='Markdown')
+        await update.effective_message.reply_text("⚠️ Usage: Reply to a user's message or use `/seekauth @username` / `/seekauth <user_id>`", parse_mode='Markdown')
         return
 
     if db_manager:
-        db_manager.grant_seek_oauth(update.effective_chat.id, target_id)
+        db_manager.grant_seek_auth(update.effective_chat.id, target_id)
         await update.effective_message.reply_text(f"✅ Granted game end power to {target_name} in this group.")
 
 
-async def rmseekoauth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def rmseekauth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type == ChatType.PRIVATE:
         await update.effective_message.reply_text("❌ This command can only be used in groups.")
         return
@@ -1277,16 +1294,16 @@ async def rmseekoauth_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     target_id, target_name = await extract_target_user_info(update, context)
     if not target_id:
-        await update.effective_message.reply_text("⚠️ Usage: Reply to a user's message or use `/rmseekoauth @username` / `/rmseekoauth <user_id>`", parse_mode='Markdown')
+        await update.effective_message.reply_text("⚠️ Usage: Reply to a user's message or use `/rmseekauth @username` / `/rmseekauth <user_id>`", parse_mode='Markdown')
         return
 
     if db_manager:
-        db_manager.revoke_seek_oauth(update.effective_chat.id, target_id)
+        db_manager.revoke_seek_auth(update.effective_chat.id, target_id)
         await update.effective_message.reply_text(f"✅ Revoked game end power from {target_name} in this group.")
 
 
 async def score_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    target_id, target_name = await extract_target_user_info(update, context)
+    target_id, target_name = await extract_target_user_info(update, context, fallback_to_sender=True)
     if not target_id:
         target_id = update.effective_user.id
         target_name = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
@@ -1816,8 +1833,10 @@ def create_application(token: str = BOT_TOKEN) -> Application | None:
     app.add_handler(CommandHandler("score", score_command))
     app.add_handler(CommandHandler("leaderboard", leaderboard_command))
     app.add_handler(CommandHandler("difficulty", difficulty_command))
-    app.add_handler(CommandHandler("seekoauth", seekoauth_command))
-    app.add_handler(CommandHandler("rmseekoauth", rmseekoauth_command))
+    app.add_handler(CommandHandler("seekauth", seekauth_command))
+    app.add_handler(CommandHandler("rmseekauth", rmseekauth_command))
+    app.add_handler(CommandHandler("seekoauth", seekauth_command))
+    app.add_handler(CommandHandler("rmseekoauth", rmseekauth_command))
     app.add_handler(CommandHandler("help", help_command))
 
     # Admin commands

@@ -96,6 +96,39 @@ class TestJSONDatabaseManager(unittest.TestCase):
         self.assertEqual(data_daily_after[0][2], 15)  # 0 reset + 15
         self.assertEqual(data_daily_after[0][3], 1)   # 0 reset + 1 win
 
+    def test_seek_auth_crud_and_backwards_compatibility(self):
+        chat_id = -100123456
+        user_id = 999
+        self.assertFalse(self.db.has_seek_auth(chat_id, user_id))
+        self.assertFalse(self.db.has_seek_oauth(chat_id, user_id))
+
+        self.db.grant_seek_auth(chat_id, user_id)
+        self.assertTrue(self.db.has_seek_auth(chat_id, user_id))
+        self.assertTrue(self.db.has_seek_oauth(chat_id, user_id))
+
+        self.db.revoke_seek_auth(chat_id, user_id)
+        self.assertFalse(self.db.has_seek_auth(chat_id, user_id))
+        self.assertFalse(self.db.has_seek_oauth(chat_id, user_id))
+
+        self.db.grant_seek_oauth(chat_id, user_id)
+        self.assertTrue(self.db.has_seek_auth(chat_id, user_id))
+
+        self.db.revoke_seek_oauth(chat_id, user_id)
+        self.assertFalse(self.db.has_seek_auth(chat_id, user_id))
+
+    def test_seek_oauth_migration(self):
+        migration_db_path = "test_migration_db.json"
+        if os.path.exists(migration_db_path):
+            os.remove(migration_db_path)
+        try:
+            with open(migration_db_path, "w", encoding="utf-8") as f:
+                json.dump({"seek_oauth": {"-100555": [777]}}, f)
+            migrated_db = JSONDatabaseManager(migration_db_path)
+            self.assertTrue(migrated_db.has_seek_auth(-100555, 777))
+        finally:
+            if os.path.exists(migration_db_path):
+                os.remove(migration_db_path)
+
 class TestApplicationConfiguration(unittest.TestCase):
     def test_create_application_custom_timeouts(self):
         token = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
@@ -172,6 +205,54 @@ class TestSafeEditMessage(unittest.IsolatedAsyncioTestCase):
 
         await safe_edit_message(query, "Fallback Reply")
         query.message.reply_text.assert_called_once_with(text="Fallback Reply", parse_mode="HTML")
+
+
+class TestSeekAuthCommands(unittest.IsolatedAsyncioTestCase):
+    async def test_seekauth_and_rmseekauth_commands(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from telegram.constants import ChatType
+        import main
+        from main import seekauth_command, rmseekauth_command
+
+        test_db_path = "test_cmd_db.json"
+        if os.path.exists(test_db_path):
+            os.remove(test_db_path)
+        db = JSONDatabaseManager(test_db_path)
+        main.db_manager = db
+
+        try:
+            # Mock update and context
+            update = MagicMock()
+            update.effective_chat.type = ChatType.SUPERGROUP
+            update.effective_chat.id = -100111222
+            update.effective_user.id = 12345
+            update.effective_message.reply_text = AsyncMock()
+
+            # Mock target user reply
+            target_user = MagicMock()
+            target_user.id = 67890
+            target_user.username = "targetuser"
+            update.effective_message.reply_to_message.from_user = target_user
+
+            context = MagicMock()
+
+            with patch('main.is_group_admin', AsyncMock(return_value=True)):
+                await seekauth_command(update, context)
+                self.assertTrue(db.has_seek_auth(-100111222, 67890))
+                update.effective_message.reply_text.assert_called_with("✅ Granted game end power to @targetuser in this group.")
+
+                await rmseekauth_command(update, context)
+                self.assertFalse(db.has_seek_auth(-100111222, 67890))
+                update.effective_message.reply_text.assert_called_with("✅ Revoked game end power from @targetuser in this group.")
+
+            # Test private chat restriction
+            update.effective_chat.type = ChatType.PRIVATE
+            await seekauth_command(update, context)
+            update.effective_message.reply_text.assert_called_with("❌ This command can only be used in groups.")
+        finally:
+            main.db_manager = None
+            if os.path.exists(test_db_path):
+                os.remove(test_db_path)
 
 if __name__ == "__main__":
     unittest.main()
