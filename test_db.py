@@ -249,6 +249,73 @@ class TestSeekAuthCommands(unittest.IsolatedAsyncioTestCase):
             update.effective_chat.type = ChatType.PRIVATE
             await seekauth_command(update, context)
             update.effective_message.reply_text.assert_called_with("❌ This command can only be used in groups.")
+
+            # Test seekauth via numeric user ID and username
+            db.save_user(998877, 'saveduser', 'Saved User')
+
+            # Setup update without reply
+            update.effective_chat.type = ChatType.SUPERGROUP
+            update.effective_message.reply_to_message = None
+            update.effective_message.entities = []
+
+            # Test user ID
+            context.args = ['998877']
+            with patch('main.is_group_admin', AsyncMock(return_value=True)):
+                await seekauth_command(update, context)
+                self.assertTrue(db.has_seek_auth(-100111222, 998877))
+
+                await rmseekauth_command(update, context)
+                self.assertFalse(db.has_seek_auth(-100111222, 998877))
+
+            # Test username argument
+            context.args = ['@saveduser']
+            with patch('main.is_group_admin', AsyncMock(return_value=True)):
+                await seekauth_command(update, context)
+                self.assertTrue(db.has_seek_auth(-100111222, 998877))
+
+                await rmseekauth_command(update, context)
+                self.assertFalse(db.has_seek_auth(-100111222, 998877))
+        finally:
+            main.db_manager = None
+            if os.path.exists(test_db_path):
+                os.remove(test_db_path)
+
+    async def test_end_game_with_seekauth_permissions(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from telegram.constants import ChatType
+        import main
+        from main import end_game_command
+
+        test_db_path = "test_cmd_db2.json"
+        if os.path.exists(test_db_path):
+            os.remove(test_db_path)
+        db = JSONDatabaseManager(test_db_path)
+        main.db_manager = db
+
+        try:
+            chat_id = -100999888
+            db.save_game_state(chat_id, {'word': 'TESTS', 'difficulty': 'medium', 'guesses_made': 0, 'max_guesses': 10})
+
+            update = MagicMock()
+            update.effective_chat.id = chat_id
+            update.effective_user.id = 554433
+            update.effective_user.username = "normaluser"
+            update.effective_user.first_name = "Normal"
+            update.effective_message.reply_text = AsyncMock()
+
+            context = MagicMock()
+
+            # Case 1: Non-admin, no seekauth -> Permission denied
+            with patch('main.is_group_admin', AsyncMock(return_value=False)):
+                await end_game_command(update, context)
+                self.assertIsNotNone(db.get_game_state(chat_id))
+                update.effective_message.reply_text.assert_called_with("🚨 You don't have permission to end the game. Group admins or authorized members (/seekauth) can end it.", parse_mode='Markdown')
+
+            # Case 2: Grant seekauth -> Normal user can end game
+            db.grant_seek_auth(chat_id, 554433)
+            with patch('main.is_group_admin', AsyncMock(return_value=False)):
+                await end_game_command(update, context)
+                self.assertIsNone(db.get_game_state(chat_id))
         finally:
             main.db_manager = None
             if os.path.exists(test_db_path):

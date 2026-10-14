@@ -91,6 +91,7 @@ class JSONDatabaseManager:
         self.lock = threading.Lock()
         self.data = {
             "leaderboard": {},
+            "users": {},
             "active_games": {},
             "known_chats": {},
             "started_users": [],
@@ -108,6 +109,7 @@ class JSONDatabaseManager:
                         loaded_data = json.load(f)
                         if isinstance(loaded_data, dict):
                             self.data["leaderboard"] = loaded_data.get("leaderboard", {})
+                            self.data["users"] = loaded_data.get("users", {})
                             self.data["active_games"] = loaded_data.get("active_games", {})
                             self.data["known_chats"] = loaded_data.get("known_chats", {})
                             self.data["started_users"] = loaded_data.get("started_users", [])
@@ -385,14 +387,48 @@ class JSONDatabaseManager:
                     user_data[f"points_{period}"] = max(0, user_data.get(f"points_{period}", 0) - points)
                 self._save_unlocked()
 
+    def save_user(self, user_id: int, username: str = "", full_name: str = ""):
+        with self.lock:
+            if not isinstance(user_id, int):
+                try:
+                    user_id = int(user_id)
+                except (ValueError, TypeError):
+                    return
+            if "users" not in self.data:
+                self.data["users"] = {}
+            u_key = str(user_id)
+            existing = self.data["users"].get(u_key, {})
+            clean_user = username if isinstance(username, str) else ""
+            clean_user = clean_user.lstrip('@') if clean_user else existing.get("username", "")
+            fname = full_name if isinstance(full_name, str) else ""
+            fname = fname or existing.get("full_name", "") or clean_user or "Player"
+            self.data["users"][u_key] = {
+                "user_id": user_id,
+                "username": clean_user,
+                "full_name": fname
+            }
+            if u_key in self.data["leaderboard"] and clean_user:
+                self.data["leaderboard"][u_key]["username"] = clean_user
+            self._save_unlocked()
+
     def get_user_score(self, user_id: int) -> dict | None:
         with self.lock:
             user_key = str(user_id)
-            return self.data["leaderboard"].get(user_key)
+            if user_key in self.data["leaderboard"]:
+                return self.data["leaderboard"][user_key]
+            if "users" in self.data and user_key in self.data["users"]:
+                return self.data["users"][user_key]
+            return None
 
     def get_user_by_username(self, username: str) -> dict | None:
         with self.lock:
             clean_name = username.lstrip('@').lower()
+            if not clean_name:
+                return None
+            for user_data in self.data.get("users", {}).values():
+                u_name = user_data.get("username", "")
+                if u_name and u_name.lower() == clean_name:
+                    return user_data
             for user_data in self.data["leaderboard"].values():
                 u_name = user_data.get("username", "")
                 if u_name and u_name.lower() == clean_name:
@@ -1028,8 +1064,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "• **/score** [user/reply] → *Check game score & wins*.\n"
             "• **/leaderboard** [period] → *Show rankings*.\n"
             "• **/difficulty** → *Show difficulty settings*.\n"
-            "• **/seekoauth** [user/reply] → *Grant game end power*.\n"
-            "• **/rmseekoauth** [user/reply] → *Remove game end power*.\n"
+            "• **/seekauth** [user/reply] → *Grant game end power*.\n"
+            "• **/rmseekauth** [user/reply] → *Remove game end power*.\n"
             "• **/help** → *Open Help Center menu*.\n"
         )
         if is_admin:
@@ -1229,36 +1265,56 @@ async def extract_target_user_info(update: Update, context: ContextTypes.DEFAULT
 
     if msg.reply_to_message and msg.reply_to_message.from_user:
         u = msg.reply_to_message.from_user
-        name = f"@{u.username}" if u.username else u.first_name
+        name = f"@{u.username}" if u.username else (getattr(u, 'full_name', None) or u.first_name)
+        if db_manager:
+            db_manager.save_user(u.id, u.username or "", getattr(u, 'full_name', None) or u.first_name)
         return u.id, name
 
     if msg.entities:
         for entity in msg.entities:
             if entity.type == MessageEntity.TEXT_MENTION and entity.user:
                 u = entity.user
-                name = f"@{u.username}" if u.username else u.first_name
+                name = f"@{u.username}" if u.username else (getattr(u, 'full_name', None) or u.first_name)
+                if db_manager:
+                    db_manager.save_user(u.id, u.username or "", getattr(u, 'full_name', None) or u.first_name)
                 return u.id, name
 
-    if context.args:
+    if context and getattr(context, 'args', None):
         arg = context.args[0].strip()
-        if arg.startswith("@"):
-            if db_manager:
-                u_data = db_manager.get_user_by_username(arg)
-                if u_data:
-                    return u_data.get("user_id"), f"@{u_data.get('username')}"
-            return None, arg
-        elif arg.isdigit() or (arg.startswith("-") and arg[1:].isdigit()):
+        if arg.isdigit() or (arg.startswith("-") and arg[1:].isdigit()):
             u_id = int(arg)
             if db_manager:
                 u_data = db_manager.get_user_score(u_id)
                 if u_data:
-                    return u_id, f"@{u_data.get('username')}" if u_data.get('username') else str(u_id)
+                    u_name = f"@{u_data.get('username')}" if u_data.get('username') else (u_data.get('full_name') or str(u_id))
+                    return u_id, u_name
             return u_id, str(u_id)
+        else:
+            clean_username = arg.lstrip("@")
+            if clean_username:
+                if db_manager:
+                    u_data = db_manager.get_user_by_username(clean_username)
+                    if u_data:
+                        u_name = f"@{u_data.get('username')}" if u_data.get('username') else f"@{clean_username}"
+                        return u_data.get("user_id"), u_name
+                if context and getattr(context, 'bot', None):
+                    try:
+                        chat = await context.bot.get_chat(f"@{clean_username}")
+                        if chat and getattr(chat, 'id', None):
+                            u_name = f"@{chat.username}" if getattr(chat, 'username', None) else (getattr(chat, 'first_name', None) or f"@{clean_username}")
+                            if db_manager:
+                                db_manager.save_user(chat.id, getattr(chat, 'username', '') or clean_username, getattr(chat, 'first_name', ''))
+                            return chat.id, u_name
+                    except Exception:
+                        pass
+                return None, f"@{clean_username}"
 
     if fallback_to_sender:
         u = update.effective_user
         if u:
-            name = f"@{u.username}" if u.username else u.first_name
+            name = f"@{u.username}" if u.username else (getattr(u, 'full_name', None) or u.first_name)
+            if db_manager:
+                db_manager.save_user(u.id, u.username or "", getattr(u, 'full_name', None) or u.first_name)
             return u.id, name
 
     return None, None
